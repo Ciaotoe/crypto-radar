@@ -1,3 +1,49 @@
 {
-  "signals": []
+  "signals": [
+    {
+      "id": "BTC/USDT-short-2026-10-18",
+      "symbol": "BTC/USDT",
+      "direction": "short",
+      "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
+      "entry_price": 81894.23,
+      "triggered_at": "2026-10-18T12:06:57.355906+08:00",
+      "last_checked_at": "2026-10-18T12:06:57.355916+08:00",
+      "status": "active",
+      "pnl_now": 0.0,
+      "mfe": 0.0,
+      "mae": 0.0,
+      "last_price": 81894.23,
+      "invalid_reason": null
+    },
+    {
+      "id": "ETH/USDT-short-2026-10-18",
+      "symbol": "ETH/USDT",
+      "direction": "short",
+      "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
+      "entry_price": 2423.12,
+      "triggered_at": "2026-10-18T12:07:06.880982+08:00",
+      "last_checked_at": "2026-10-18T12:07:06.880992+08:00",
+      "status": "active",
+      "pnl_now": 0.0,
+      "mfe": 0.0,
+      "mae": 0.0,
+      "last_price": 2423.12,
+      "invalid_reason": null
+    },
+    {
+      "id": "SOL/USDT-short-2026-10-18",
+      "symbol": "SOL/USDT",
+      "direction": "short",
+      "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
+      "entry_price": 104.34,
+      "triggered_at": "2026-10-18T12:07:20.801194+08:00",
+      "last_checked_at": "2026-10-18T12:07:20.801204+08:00",
+      "status": "active",
+      "pnl_now": 0.0,
+      "mfe": 0.0,
+      "mae": 0.0,
+      "last_price": 104.34,
+      "invalid_reason": null
+    }
+  ]
 }
