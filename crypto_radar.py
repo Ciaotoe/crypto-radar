@@ -232,11 +232,13 @@ def run_scan():
         except Exception as e:
             print(f"[{sym}] 扫描异常: {e}")
 
-    # 每小时至多推一条追踪摘要: 仅当有新信号推过, 或本次是整点后首次巡检
-    hour_mark = int(time.strftime('%M')) < 25  # cron 5 分档为整点后首跑
-    if open_signals(store) and (new_pushed or hour_mark):
+    # 每小时至多推一条追踪摘要: 按档案记录上次推送的小时,
+    # 本小时未推过且有未关闭信号就推(错过 :05 会在 :25/:45 补上)
+    hour_now = tracker._now().strftime('%Y-%m-%d %H')
+    if open_signals(store) and store.get('last_summary_hour') != hour_now:
         try:
             send_tracking_summary(store)
+            store['last_summary_hour'] = hour_now
         except Exception as e:
             print(f"追踪摘要推送失败: {e}")
 
