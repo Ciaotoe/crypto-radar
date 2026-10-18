@@ -85,7 +85,8 @@ def record_new_signal(store, data, signal_type):
         "last_price": data['price'],
         "invalid_reason": None,
     }
-    store['signals'].append(sig)
+    # 注意: 只构造不追加, 由调用方在推送成功后 append,
+    # 避免"已建档未推送"被同日去重挡住导致当日永久漏推
     return sig
 
 

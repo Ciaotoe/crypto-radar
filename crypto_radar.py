@@ -224,6 +224,8 @@ def run_scan():
                 print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送 TG...")
                 strategy = generate_ai_strategy(data, signal, fng)
                 send_telegram_msg(sym, data['price'], signal, strategy)
+                # 推送成功才正式建档: 失败时回退, 下次巡检信号仍成立会重试推送
+                store['signals'].append(sig)
                 new_pushed = True
             else:
                 print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
