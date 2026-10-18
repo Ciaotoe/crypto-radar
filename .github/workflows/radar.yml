@@ -2,8 +2,11 @@ name: crypto-radar
 
 on:
   schedule:
-    - cron: '0 * * * *'  # 每小时整点(UTC)巡检
+    - cron: '5,25,45 * * * *'  # 每小时三次, 错开整点排队高峰
   workflow_dispatch: {}  # 允许手动触发测试
+
+permissions:
+  contents: write  # 允许运行结束把 signals.json 变化提交回仓库
 
 jobs:
   scan:
@@ -23,3 +26,12 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: uv run crypto_radar.py
+
+      # 仓库即数据库: 把信号档案变化提交回 main, 供下次运行读取
+      - name: Commit signal data
+        run: |
+          git config user.name "radar-bot"
+          git config user.email "radar-bot@users.noreply.github.com"
+          git add data/signals.json
+          git diff --cached --quiet || git commit -m "data: update signal tracking [skip ci]"
+          git push

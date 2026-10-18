@@ -3,6 +3,7 @@ import time
 import requests
 import pandas as pd
 import pandas_ta as ta
+import tracker
 
 # ================= 1. 核心配置区 =================
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
@@ -172,22 +173,72 @@ def send_telegram_msg(symbol, price, signal_type, strategy_text):
     )
     resp.raise_for_status()
 
+def open_signals(store):
+    """返回所有未机械关闭(仍在追踪)的信号"""
+    return [s for s in store['signals'] if s['status'] != 'closed']
+
+
+def send_tracking_summary(store):
+    """推送追踪中信号的表现摘要(每小时至多一条; 无未关闭信号则不推)"""
+    open_sigs = open_signals(store)
+    if not open_sigs:
+        return
+    lines = ["📊 <b>信号追踪摘要</b>"]
+    for s in sorted(open_sigs, key=lambda x: x['triggered_at']):
+        emoji = "🟢" if s['direction'] == 'long' else "🔴"
+        trig = s['triggered_at'][:16]
+        status_txt = {"active": "趋势成立", "invalid": "⚠️趋势已翻转"}[s['status']]
+        lines.append(
+            f"{emoji} {s['symbol']} {'做多' if s['direction'] == 'long' else '做空'}"
+            f" @{s['entry_price']} ({trig})\n"
+            f"现价 {s['last_price']} | 浮盈 {s['pnl_now']:+.2f}%"
+            f" | 峰值 {s['mfe']:+.2f}% | 最差 {s['mae']:+.2f}% | {status_txt}"
+        )
+    requests.post(
+        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT_ID, "text": "\n\n".join(lines), "parse_mode": "HTML"},
+        timeout=10,
+    ).raise_for_status()
+
+
 def run_scan():
     if not TG_BOT_TOKEN or not TG_CHAT_ID or not GEMINI_API_KEY:
         raise SystemExit("TG_BOT_TOKEN / TG_CHAT_ID / GEMINI_API_KEY 未设置")
+
+    # 先更新历史信号档案
+    store = tracker.load_signals()
+    tracking_changed = tracker.update_open_signals(store, get_market_data)
+
     fng = get_macro_sentiment()
+    new_pushed = False
     for sym in SYMBOLS:
         try:
             data = get_market_data(sym)
             signal = check_signal(data)
             if signal:
+                sig = tracker.record_new_signal(data, signal)
+                if sig is None:
+                    # 同日同向信号已在追踪, 不重复推新策略, 只更新档案
+                    print(f"[{sym}] 信号持续成立(已在追踪), 不重复推送")
+                    continue
                 print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送 TG...")
                 strategy = generate_ai_strategy(data, signal, fng)
                 send_telegram_msg(sym, data['price'], signal, strategy)
+                new_pushed = True
             else:
                 print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
         except Exception as e:
             print(f"[{sym}] 扫描异常: {e}")
+
+    # 每小时至多推一条追踪摘要: 仅当有新信号推过, 或本次是整点后首次巡检
+    hour_mark = int(time.strftime('%M')) < 25  # cron 5 分档为整点后首跑
+    if open_signals(store) and (new_pushed or hour_mark):
+        try:
+            send_tracking_summary(store)
+        except Exception as e:
+            print(f"追踪摘要推送失败: {e}")
+
+    tracker.save_signals(store)
 
 if __name__ == "__main__":
     run_scan()
