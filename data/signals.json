@@ -7,12 +7,12 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 81894.23,
       "triggered_at": "2026-10-18T12:06:57.355906+08:00",
-      "last_checked_at": "2026-10-18T16:47:56.288046+08:00",
+      "last_checked_at": "2026-10-18T21:10:31.307618+08:00",
       "status": "active",
-      "pnl_now": 0.209,
+      "pnl_now": -0.049,
       "mfe": 0.209,
-      "mae": -0.025,
-      "last_price": 81723.37,
+      "mae": -0.049,
+      "last_price": 81934.43,
       "invalid_reason": null
     },
     {
@@ -22,12 +22,12 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 2423.12,
       "triggered_at": "2026-10-18T12:07:06.880982+08:00",
-      "last_checked_at": "2026-10-18T16:47:56.288046+08:00",
+      "last_checked_at": "2026-10-18T21:10:31.307618+08:00",
       "status": "active",
-      "pnl_now": 0.507,
+      "pnl_now": 0.388,
       "mfe": 0.507,
       "mae": 0.0,
-      "last_price": 2410.83,
+      "last_price": 2413.71,
       "invalid_reason": null
     },
     {
@@ -37,14 +37,14 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 104.34,
       "triggered_at": "2026-10-18T12:07:20.801194+08:00",
-      "last_checked_at": "2026-10-18T16:47:56.288046+08:00",
+      "last_checked_at": "2026-10-18T21:10:31.307618+08:00",
       "status": "active",
-      "pnl_now": 1.16,
+      "pnl_now": 0.45,
       "mfe": 1.16,
       "mae": 0.0,
-      "last_price": 103.13,
+      "last_price": 103.87,
       "invalid_reason": null
     }
   ],
-  "last_summary_hour": "2026-10-18 16"
+  "last_summary_hour": "2026-10-18 21"
 }
