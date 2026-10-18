@@ -143,9 +143,10 @@ def generate_ai_strategy(data, signal_type, fng):
 【时间预期】：X 小时内应脱离成本区，若超时横盘怎么处理
 【核心逻辑】：用 2 句话简明扼要说明制定该策略的原因（结合趋势、点位与资金费率）。
 """
-    # Gemini 原生 REST 接口, 无需 SDK
+    # Gemini 原生 REST 接口, 无需 SDK; 模型可经 GEMINI_MODEL 环境变量覆盖
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
         json={"contents": [{"parts": [{"text": prompt}]}]},
         timeout=60,
     )
