@@ -216,7 +216,7 @@ def run_scan():
             data = get_market_data(sym)
             signal = check_signal(data)
             if signal:
-                sig = tracker.record_new_signal(data, signal)
+                sig = tracker.record_new_signal(store, data, signal)
                 if sig is None:
                     # 同日同向信号已在追踪, 不重复推新策略, 只更新档案
                     print(f"[{sym}] 信号持续成立(已在追踪), 不重复推送")

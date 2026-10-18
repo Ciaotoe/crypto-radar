@@ -63,9 +63,9 @@ def find_signal(store, signal_id):
     return None
 
 
-def record_new_signal(data, signal_type):
-    """新信号建档。若同 ID 信号当日已存在(含已 closed), 返回 None 表示不重复推。"""
-    store = load_signals()
+def record_new_signal(store, data, signal_type):
+    """在传入的 store 中建档新信号。若同 ID 信号当日已存在(含已 closed),
+    返回 None 表示不重复推。注意: 不落盘, 由调用方统一 save_signals。"""
     direction = 'long' if '做多' in signal_type else 'short'
     sid = make_signal_id(data['symbol'], direction)
     if find_signal(store, sid):
@@ -86,7 +86,6 @@ def record_new_signal(data, signal_type):
         "invalid_reason": None,
     }
     store['signals'].append(sig)
-    save_signals(store)
     return sig
 
 
