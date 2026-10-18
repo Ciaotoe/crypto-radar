@@ -10,3 +10,4 @@ __pycache__/
 cron.log
 
 # uv.lock 需要提交, 保证依赖可复现
+.claude/
