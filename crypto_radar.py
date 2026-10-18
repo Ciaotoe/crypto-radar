@@ -1,0 +1,199 @@
+import os
+import time
+import requests
+import pandas as pd
+import pandas_ta as ta
+from google import genai
+
+# ================= 1. 核心配置区 =================
+SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+# 通过 `uv run --env-file .env` 注入, 勿在代码里写死密钥
+FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# 本机出口 IP 被币安主站按地域封锁(HTTP 451), K线改走币安官方公开行情镜像;
+# 资金费率主站同样被封, 改用 OKX 同品种 U 本位永续的费率作参考(2026-10 确认可用)
+BINANCE_MIRROR = "https://data-api.binance.vision"
+OKX_API = "https://www.okx.com"
+
+# ================= 2. 权威数据抓取与指标计算 =================
+def fetch_klines(symbol, interval, limit):
+    """从币安公开行情镜像拉取 K 线 (无需 API Key)"""
+    pair = symbol.replace('/', '')
+    res = requests.get(
+        f"{BINANCE_MIRROR}/api/v3/klines",
+        params={"symbol": pair, "interval": interval, "limit": limit},
+        timeout=15,
+    )
+    res.raise_for_status()
+    rows = res.json()
+    # 币安 klines 实际返回 12 列, 只取前 6 列 (time/open/high/low/close/volume)
+    df = pd.DataFrame([row[:6] for row in rows],
+                      columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    return df.astype(float)
+
+def fetch_funding_rate(symbol):
+    """从 OKX 公开接口获取同品种 U 本位永续实时资金费率, 失败返回 0"""
+    inst_id = symbol.replace('/USDT', '-USDT-SWAP')
+    try:
+        res = requests.get(
+            f"{OKX_API}/api/v5/public/funding-rate",
+            params={"instId": inst_id},
+            timeout=10,
+        ).json()
+        return round(float(res['data'][0]['fundingRate']) * 100, 4)
+    except Exception:
+        return 0.0
+
+def get_market_data(symbol):
+    """拉取 4H(看趋势) 和 1H(找点位) 数据并精确计算指标"""
+    df_4h = fetch_klines(symbol, '4h', 250)
+    df_1h = fetch_klines(symbol, '1h', 250)
+
+    # --- 4H 大周期趋势指标 ---
+    df_4h['ema20'] = ta.ema(df_4h['close'], length=20)
+    df_4h['ema50'] = ta.ema(df_4h['close'], length=50)
+    df_4h['ema200'] = ta.ema(df_4h['close'], length=200)
+    adx_4h = ta.adx(df_4h['high'], df_4h['low'], df_4h['close'], length=14)
+    df_4h['adx'] = adx_4h['ADX_14']
+
+    # --- 1H 小周期点位与波动率指标 ---
+    df_1h['ema20'] = ta.ema(df_1h['close'], length=20)
+    df_1h['rsi'] = ta.rsi(df_1h['close'], length=14)
+    df_1h['atr'] = ta.atr(df_1h['high'], df_1h['low'], df_1h['close'], length=14)
+    # 过去24小时高低点作为近期结构参考
+    df_1h['recent_high'] = df_1h['high'].rolling(24).max()
+    df_1h['recent_low'] = df_1h['low'].rolling(24).min()
+
+    # --- 获取永续合约实时资金费率 (OKX) ---
+    funding_rate = fetch_funding_rate(symbol)
+
+    c4 = df_4h.iloc[-1]
+    c1 = df_1h.iloc[-1]
+
+    return {
+        "symbol": symbol,
+        "price": round(float(c1['close']), 2),
+        "4h_ema20": round(float(c4['ema20']), 2),
+        "4h_ema50": round(float(c4['ema50']), 2),
+        "4h_ema200": round(float(c4['ema200']), 2),
+        "4h_adx": round(float(c4['adx']), 1),
+        "1h_rsi": round(float(c1['rsi']), 1),
+        "1h_atr": round(float(c1['atr']), 2),
+        "24h_high": round(float(c1['recent_high']), 2),
+        "24h_low": round(float(c1['recent_low']), 2),
+        "funding_rate_pct": funding_rate
+    }
+
+def get_macro_sentiment():
+    """获取加密市场当日恐慌贪婪指数"""
+    try:
+        res = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()
+        val = res['data'][0]['value']
+        status = res['data'][0]['value_classification']
+        return f"{val} ({status})"
+    except Exception:
+        return "未知"
+
+# ================= 3. 趋势与点位硬性初筛漏斗 =================
+def check_signal(data):
+    """
+    判断当前是否有确定性方向与合适点位：
+    - 若处于震荡期 (ADX < 22) 或价格悬空，返回 None
+    - 只有大趋势确立 + 小周期回踩/反弹到位，才唤醒 AI
+    """
+    price = data['price']
+    ema20_4h = data['4h_ema20']
+    ema50_4h = data['4h_ema50']
+    adx = data['4h_adx']
+    rsi_1h = data['1h_rsi']
+
+    # 1. 多头顺势回踩机会：4H多头排列 + ADX>22确认趋势 + 价格回踩接近4H EMA20(偏离度小于2%) 且 1H RSI未超买(<58)
+    dist_to_ema20 = abs(price - ema20_4h) / ema20_4h
+    if price > ema50_4h and ema20_4h > ema50_4h and adx >= 22:
+        if dist_to_ema20 <= 0.02 and rsi_1h <= 58:
+            return "顺势做多 (4H上升趋势确立 + 1H回踩关键均线支撑)"
+
+    # 2. 空头顺势反弹机会：4H空头排列 + ADX>22确认趋势 + 价格反弹接近4H EMA20 且 1H RSI未超卖(>42)
+    if price < ema50_4h and ema20_4h < ema50_4h and adx >= 22:
+        if dist_to_ema20 <= 0.02 and rsi_1h >= 42:
+            return "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)"
+
+    return None
+
+# ================= 4. AI 极简策略生成与飞书推送 =================
+def generate_ai_strategy(data, signal_type, fng):
+    """调用 Gemini 生成直接、简练的执行策略"""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    prompt = f"""
+你是一个实战派加密货币交易参谋。当前监控程序捕捉到一个确定性交易机会，请根据以下币安实时数据直接给出交易策略。
+要求：极度精炼、拒绝废话，直接给点位和简短原因！
+
+【实时数据】
+- 币种：{data['symbol']} | 当前价：${data['price']}
+- 触发类型：{signal_type}
+- 4H 趋势指标：EMA20=${data['4h_ema20']}, EMA50=${data['4h_ema50']}, EMA200=${data['4h_ema200']}, ADX趋势强度={data['4h_adx']}
+- 1H 点位指标：RSI={data['1h_rsi']}, ATR波动率=${data['1h_atr']}, 过去24h高低点=${data['24h_low']} - ${data['24h_high']}
+- 合约资金费率：{data['funding_rate_pct']}% | 市场恐慌贪婪指数：{fng}
+
+请严格按以下格式输出（不要多余寒暄）：
+【方向】：做多 / 做空
+【建议入场】：具体价格区间
+【硬止损位】：具体价格（参考1.5倍ATR或结构位，注明亏损百分比）
+【分批止盈】：TP1 价格 / TP2 价格（确保盈亏比大于 1:2）
+【时间预期】：X 小时内应脱离成本区，若超时横盘怎么处理
+【核心逻辑】：用 2 句话简明扼要说明制定该策略的原因（结合趋势、点位与资金费率）。
+"""
+    response = client.models.generate_content(
+        model='gemini-2.5-flash',
+        contents=prompt
+    )
+    return response.text.strip()
+
+def send_feishu_card(symbol, price, signal_type, strategy_text):
+    """发送精美的飞书富文本卡片"""
+    color = "green" if "做多" in signal_type else "red"
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": f"🎯 交易策略触发 | {symbol} (${price})"},
+                "template": color
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**信号类型：** {signal_type}\n\n{strategy_text}"
+                    }
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "note",
+                    "elements": [{"tag": "plain_text", "content": f"数据来源：Binance 官方实时 API | 触发时间：{time.strftime('%Y-%m-%d %H:%M')}"}]
+                }
+            ]
+        }
+    }
+    requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+
+def run_scan():
+    if not FEISHU_WEBHOOK or not GEMINI_API_KEY:
+        raise SystemExit("FEISHU_WEBHOOK / GEMINI_API_KEY 未设置, 请通过 `uv run --env-file .env crypto_radar.py` 注入")
+    fng = get_macro_sentiment()
+    for sym in SYMBOLS:
+        try:
+            data = get_market_data(sym)
+            signal = check_signal(data)
+            if signal:
+                print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送飞书...")
+                strategy = generate_ai_strategy(data, signal, fng)
+                send_feishu_card(sym, data['price'], signal, strategy)
+            else:
+                print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
+        except Exception as e:
+            print(f"[{sym}] 扫描异常: {e}")
+
+if __name__ == "__main__":
+    run_scan()
