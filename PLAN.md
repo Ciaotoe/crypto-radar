@@ -55,6 +55,13 @@
 ## 进度记录
 - [x] 泄露排查 + 仓库转 public (2026-10-18)
 - [x] 步骤1 tracker.py (4 组断言通过: pnl 方向/同日去重/mfe-mae 累积/48h 关闭与 invalid 流转)
-- [ ] 步骤2 主流程接入
-- [ ] 步骤3 工作流改造
-- [ ] 步骤4 端到端验证
+- [x] 步骤2 主流程接入 (本地真实数据建档/更新/摘要生成跑通)
+- [x] 步骤3 工作流改造 (cron 5,25,45; data 自动 commit+push 验证通过)
+- [x] 步骤4 端到端验证 (Actions run 成功, 3 信号持久化, TG 推送成功)
+
+## 关键记录
+- 端到端首跑发现 bug: record_new_signal 内部自行 load/save, 被 run_scan 末尾
+  用旧 store 覆盖, 信号档案被抹空。改为操作调用方传入的 store、由 run_scan 统一
+  save, 单测+Actions 重跑均通过。
+- 会话工具输出对邮箱地址做显示层脱敏(Read 显示 {{EMAIL_xxx}}), 磁盘文件实际
+  内容正常, 以 cat -A/repr 验证过 —— 后续遇到 Read 显示占位符先验文件再改。
