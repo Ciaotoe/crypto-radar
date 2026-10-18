@@ -3,12 +3,12 @@ import time
 import requests
 import pandas as pd
 import pandas_ta as ta
-from google import genai
 
 # ================= 1. 核心配置区 =================
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-# 通过 `uv run --env-file .env` 注入, 勿在代码里写死密钥
-FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+# 通过环境变量注入(本地 .env 或 GitHub Actions Secrets), 勿在代码里写死密钥
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # 本机出口 IP 被币安主站按地域封锁(HTTP 451), K线改走币安官方公开行情镜像;
@@ -123,8 +123,7 @@ def check_signal(data):
 
 # ================= 4. AI 极简策略生成与飞书推送 =================
 def generate_ai_strategy(data, signal_type, fng):
-    """调用 Gemini 生成直接、简练的执行策略"""
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    """调用 Gemini 原生 REST 接口生成直接、简练的执行策略"""
     prompt = f"""
 你是一个实战派加密货币交易参谋。当前监控程序捕捉到一个确定性交易机会，请根据以下币安实时数据直接给出交易策略。
 要求：极度精炼、拒绝废话，直接给点位和简短原因！
@@ -144,52 +143,46 @@ def generate_ai_strategy(data, signal_type, fng):
 【时间预期】：X 小时内应脱离成本区，若超时横盘怎么处理
 【核心逻辑】：用 2 句话简明扼要说明制定该策略的原因（结合趋势、点位与资金费率）。
 """
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt
+    # Gemini 原生 REST 接口, 无需 SDK
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+        json={"contents": [{"parts": [{"text": prompt}]}]},
+        timeout=60,
     )
-    return response.text.strip()
+    resp.raise_for_status()
+    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-def send_feishu_card(symbol, price, signal_type, strategy_text):
-    """发送精美的飞书富文本卡片"""
-    color = "green" if "做多" in signal_type else "red"
-    payload = {
-        "msg_type": "interactive",
-        "card": {
-            "header": {
-                "title": {"tag": "plain_text", "content": f"🎯 交易策略触发 | {symbol} (${price})"},
-                "template": color
-            },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"**信号类型：** {signal_type}\n\n{strategy_text}"
-                    }
-                },
-                {"tag": "hr"},
-                {
-                    "tag": "note",
-                    "elements": [{"tag": "plain_text", "content": f"数据来源：Binance 官方实时 API | 触发时间：{time.strftime('%Y-%m-%d %H:%M')}"}]
-                }
-            ]
-        }
-    }
-    requests.post(FEISHU_WEBHOOK, json=payload, timeout=10)
+def send_telegram_msg(symbol, price, signal_type, strategy_text):
+    """推送 TG 消息 (HTML 排版, 规避 Markdown 转义坑)"""
+    emoji = "🟢" if "做多" in signal_type else "🔴"
+    text = (
+        f"{emoji} <b>交易策略触发 | {symbol} (${price})</b>\n"
+        f"<b>信号类型：</b>{signal_type}\n\n"
+        f"{strategy_text}\n\n"
+        f"数据来源：Binance 镜像 + OKX | {time.strftime('%Y-%m-%d %H:%M')}"
+    )
+    # TG 单条消息上限 4096 字符
+    if len(text) > 4000:
+        text = text[:4000] + "…"
+    resp = requests.post(
+        f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"},
+        timeout=10,
+    )
+    resp.raise_for_status()
 
 def run_scan():
-    if not FEISHU_WEBHOOK or not GEMINI_API_KEY:
-        raise SystemExit("FEISHU_WEBHOOK / GEMINI_API_KEY 未设置, 请通过 `uv run --env-file .env crypto_radar.py` 注入")
+    if not TG_BOT_TOKEN or not TG_CHAT_ID or not GEMINI_API_KEY:
+        raise SystemExit("TG_BOT_TOKEN / TG_CHAT_ID / GEMINI_API_KEY 未设置")
     fng = get_macro_sentiment()
     for sym in SYMBOLS:
         try:
             data = get_market_data(sym)
             signal = check_signal(data)
             if signal:
-                print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送飞书...")
+                print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送 TG...")
                 strategy = generate_ai_strategy(data, signal, fng)
-                send_feishu_card(sym, data['price'], signal, strategy)
+                send_telegram_msg(sym, data['price'], signal, strategy)
             else:
                 print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
         except Exception as e:

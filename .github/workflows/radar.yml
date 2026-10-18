@@ -1,0 +1,25 @@
+name: crypto-radar
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # 每小时整点(UTC)巡检
+  workflow_dispatch: {}  # 允许手动触发测试
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run radar
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: uv run crypto_radar.py
