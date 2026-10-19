@@ -47,9 +47,13 @@ TREND_REVERSED = 'trend_reversed'
 # 预警类型与默认阈值(环境变量可覆盖; 值是初版经验值, 按长期统计调整后可收紧)
 ALERT_DRAWDOWN = 'drawdown'  # 浮盈大幅回吐
 ALERT_ADX = 'adx'            # 趋势动能消散
+ALERT_STALL = 'stall'        # 超时横盘: 超过策略时间预期仍未脱离成本区(只预警不结案, 2026-10-19 用户确认)
+ALERT_FUNDING = 'funding'    # 资金费率异动: 逆势费率深值(拥挤风险), 交易所自动结算但需提示轧空/踩踏可能
 DRAWDOWN_MIN_MFE = float(os.getenv('RADAR_DRAWDOWN_MIN_MFE', '1.0'))  # 峰值低于此不预警回吐
 DRAWDOWN_KEEP_RATIO = float(os.getenv('RADAR_DRAWDOWN_KEEP_RATIO', '0.33'))  # 现浮盈/峰值低于此则预警
 ADX_FLOOR = float(os.getenv('RADAR_ADX_FLOOR', '22'))  # 与 check_signal 初筛下限一致
+STALL_COST_BAND = float(os.getenv('RADAR_STALL_COST_BAND', '0.5'))  # "仍在成本区"的浮盈带宽 %
+FUNDING_SPIKE = float(os.getenv('RADAR_FUNDING_SPIKE', '0.1'))  # 逆势费率深值阈值 %
 
 
 def _now():
@@ -113,7 +117,8 @@ def record_new_signal(store, data, signal_type, strategy=None):
         "direction": direction,
         "signal_type": signal_type,
         "entry_price": data['price'],
-        "strategy": strategy,  # {"stop","tp1","tp2","text"} 或 None(机械追踪)
+        # {"stop","tp1","tp2","hold_hours","timeout_action","text"} 或 None(机械追踪)
+        "strategy": strategy,
         "triggered_at": now.isoformat(),
         "last_checked_at": now.isoformat(),
         "status": "active",
@@ -164,7 +169,7 @@ def _tp1_hit(strategy, direction, hi, lo):
     return lo <= tp1 if direction == 'short' else hi >= tp1
 
 
-def _check_alerts(sig, d):
+def _check_alerts(sig, d, now):
     """预警判定(不结案)。返回本次新触发的预警类型列表; 同类型只推一次"""
     fired = []
     # 浮盈大幅回吐: 峰值够高且现浮盈已回落到峰值 1/3 以下
@@ -175,6 +180,21 @@ def _check_alerts(sig, d):
     # 趋势动能消散
     if ALERT_ADX not in sig['alerts_fired'] and d['4h_adx'] < ADX_FLOOR:
         fired.append(ALERT_ADX)
+    # 超时横盘: 超过策略自己写的时间预期仍未脱离成本区。
+    # 策略文本的"时间预期"此前从未被执行(2026-10-19 用户指出), 现落地为预警
+    strat = sig['strategy']
+    if ALERT_STALL not in sig['alerts_fired'] and strat \
+       and strat.get('hold_hours') \
+       and now - _parse_dt(sig['triggered_at']) >= timedelta(hours=strat['hold_hours']) \
+       and abs(sig['pnl_now']) < STALL_COST_BAND:
+        fired.append(ALERT_STALL)
+    # 资金费率异动: 逆势费率深值说明市场与该单方向高度拥挤, 有轧空/踩踏风险。
+    # 费率符号: 空单的逆势方向是费率深负(空头付费拥挤), 多单反之
+    if ALERT_FUNDING not in sig['alerts_fired'] \
+       and d.get('funding_rate_pct') is not None \
+       and ((sig['direction'] == 'short' and d['funding_rate_pct'] <= -FUNDING_SPIKE)
+            or (sig['direction'] == 'long' and d['funding_rate_pct'] >= FUNDING_SPIKE)):
+        fired.append(ALERT_FUNDING)
     return fired
 
 
@@ -265,7 +285,7 @@ def update_open_signals(store, get_market_data, fetch_klines=None):
             continue
 
         # 4) 预警(不结案)
-        for alert in _check_alerts(sig, d):
+        for alert in _check_alerts(sig, d, now):
             sig['alerts_fired'].append(alert)
             changed = True
             events.append({"sig": sig, "type": "alert", "reason": alert})

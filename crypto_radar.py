@@ -1,6 +1,7 @@
 import os
 import time
 import json
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import pandas_ta as ta
@@ -162,7 +163,8 @@ def generate_ai_strategy(data, signal_type, fng):
   "stop": 硬止损位数字（参考1.5倍ATR或结构位，须能注明亏损百分比）,
   "tp1": 第一止盈位数字（确保盈亏比大于 1:2）,
   "tp2": 第二止盈位数字,
-  "time_expect": "X 小时内应脱离成本区，若超时横盘怎么处理",
+  "hold_hours": 数字，预计几小时内应脱离成本区（一般 6-24）,
+  "timeout_action": "若超时横盘怎么处理"（一句话，超时预警时会原文转述）,
   "logic": "用 2 句话简明扼要说明制定该策略的原因（结合趋势、点位与资金费率）"
 }}
 """
@@ -195,7 +197,10 @@ def parse_strategy(raw, data, signal_type):
         if direction == ('long' if expect_long else 'short') and \
            ((direction == 'short' and stop > price > tp1 > tp2) or
             (direction == 'long' and stop < price < tp1 < tp2)):
+            # hold_hours/timeout_action 可选: 缺失不挡建档, 只是超时横盘预警无据可依
             strategy = {"stop": stop, "tp1": tp1, "tp2": tp2,
+                        "hold_hours": float(obj['hold_hours']) if obj.get('hold_hours') else None,
+                        "timeout_action": obj.get('timeout_action') or '',
                         "text": raw}
             text = format_strategy_text(obj, data)
             return text, strategy
@@ -211,12 +216,15 @@ def format_strategy_text(obj, data):
     """由代码把 JSON 渲染成与旧版观感一致的推送文案"""
     d = "做多 🟢" if obj['direction'] == '做多' else "做空 🔴"
     stop_loss_pct = abs(obj['stop'] - data['price']) / data['price'] * 100
+    timeout_txt = f"{obj['hold_hours']:.0f} 小时内应脱离成本区"
+    if obj.get('timeout_action'):
+        timeout_txt += f"；超时则{obj['timeout_action']}"
     return (
         f"【方向】：{d}\n"
         f"【建议入场】：{obj['entry']}\n"
         f"【硬止损位】：{obj['stop']:.2f}（约亏 {stop_loss_pct:.1f}%）\n"
         f"【分批止盈】：TP1 {obj['tp1']:.2f} / TP2 {obj['tp2']:.2f}（TP1 到位可减仓保本）\n"
-        f"【时间预期】：{obj['time_expect']}\n"
+        f"【时间预期】：{timeout_txt}\n"
         f"【核心逻辑】：{obj['logic']}"
     )
 
@@ -238,6 +246,82 @@ def send_telegram_msg(symbol, price, signal_type, strategy_text):
         timeout=10,
     )
     resp.raise_for_status()
+
+def fetch_news_headlines():
+    """拉加密市场新闻头条(CoinDesk RSS, 公开无 key), 供 AI 复核消息面。
+    失败返回空列表 —— 复核在没有新闻时仍可基于费率/FNG 判断。"""
+    try:
+        res = requests.get("https://www.coindesk.com/arc/outboundfeeds/rss/",
+                           timeout=10)
+        res.raise_for_status()
+        items = res.text.split('<item>')[1:6]  # 最近 5 条够了
+        heads = []
+        for it in items:
+            t = it.split('<title>')[1].split('</title>')[0]
+            heads.append(t.replace('<![CDATA[', '').replace(']]>', '').strip())
+        return heads
+    except Exception:
+        return []
+
+
+# AI 复核间隔(小时): 消息面变化通常数小时内兑现到价格, 2h 在轧空等快速
+# 行情里能抢在排列翻转前提醒(2026-10-19 与用户确认 4h 太久)。可经环境变量调整
+AI_REVIEW_HOURS = float(os.getenv("RADAR_AI_REVIEW_HOURS", "2"))
+_sig_last_review = {}  # {signal_id: iso时间} 复核节流, 不落盘(丢一次无碍)
+
+
+def review_signals_with_ai(store, events):
+    """在持信号每 AI_REVIEW_HOURS 做一次消息面复核(真正看新闻的那一层)。
+    机械规则覆盖不到的阴跌/消息面异动, 由大模型基于头条+费率+FNG 判断;
+    只产出 alert 事件, 结案权仍在机械层。API 调用有节流, 无单时不调用。"""
+    now = datetime.now(tracker.BJ_TZ)
+    to_review = []
+    for s in open_signals(store):
+        last = _sig_last_review.get(s['id'])
+        if last is None or now - datetime.fromisoformat(last) >= timedelta(hours=AI_REVIEW_HOURS):
+            to_review.append(s)
+    if not to_review:
+        return
+    heads = fetch_news_headlines()
+    fng = get_macro_sentiment()
+    for s in to_review:
+        _sig_last_review[s['id']] = now.isoformat()
+        try:
+            d = get_market_data(s['symbol'])
+            verdict = ask_ai_review(s, d, heads, fng)
+            if verdict:
+                s['alerts_fired'].append('ai_review')
+                events.append({"sig": s, "type": "alert", "reason": "ai_review",
+                               "detail": verdict})
+        except Exception as e:
+            print(f"[{s['symbol']}] AI 复核异常: {e}")
+
+
+def ask_ai_review(sig, d, heads, fng):
+    """单信号 AI 复核: 返回异常描述(触发预警)或 None(正常持有)。"""
+    news = "\n".join(f"- {h}" for h in heads) or "(暂无可用头条)"
+    prompt = f"""你是加密货币持仓风控参谋。我在{'做空' if sig['direction']=='short' else '做多'} {sig['symbol']}，入场价 {sig['entry_price']}，
+当前价 {d['price']}，浮盈 {sig['pnl_now']:+.2f}%（期间峰值 {sig['mfe']:+.2f}%）。
+4H ADX={d['4h_adx']}，资金费率 {d['funding_rate_pct']}%，恐慌贪婪指数 {fng}。
+
+近期市场头条：
+{news}
+
+只回答一个问题：是否有值得持仓者立刻注意的消息面或数据异常（利空突袭、监管突发、轧空风险、动能与消息背离等）？
+- 一切正常：只输出"OK"
+- 有异常：用一句话说明异常和应采取的动作，不超过50字。不要输出其他任何内容。"""
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+        json={"contents": [{"parts": [{"text": prompt}]}]},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    out = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if out.upper().startswith("OK"):
+        return None
+    return out[:60]
+
 
 def open_signals(store):
     """返回所有未结案(仍在追踪)的信号"""
@@ -297,9 +381,18 @@ def send_event_notice(events):
         lines.append("⚠️ <b>预警</b>")
         for e in alerts:
             s = e['sig']
+            strat = s.get('strategy') or {}
             if e['reason'] == 'drawdown':
                 detail = (f"浮盈大幅回吐: 峰值 {s['mfe']:+.2f}% -> 现 {s['pnl_now']:+.2f}%, "
                           f"注意离场时机")
+            elif e['reason'] == 'stall':
+                act = strat.get('timeout_action') or '策略未给出超时预案'
+                detail = (f"开仓已超策略时间预期({strat.get('hold_hours')}h)仍在成本区"
+                          f"(浮盈 {s['pnl_now']:+.2f}%), 策略自己说过: {act}")
+            elif e['reason'] == 'funding':
+                detail = "资金费率出现逆势深值, 该方向拥挤, 有轧空/踩踏风险"
+            elif e['reason'] == 'ai_review':
+                detail = f"AI 消息面复核: {e.get('detail', '')}"
             else:
                 detail = "4H ADX 跌破 22, 趋势动能消散, 留意假突破"
             lines.append(
@@ -320,6 +413,8 @@ def run_scan():
     # 先更新历史信号档案: 结案/预警事件攒起来最后合并推一条
     store = tracker.load_signals()
     _, events = tracker.update_open_signals(store, get_market_data, fetch_klines_since)
+    # 在持信号的消息面复核(带节流, 有单才调用 API)
+    review_signals_with_ai(store, events)
 
     fng = get_macro_sentiment()
     # 全币种先扫描完再择优: 一次只推一个策略, 避免同时来好几单无从选择
