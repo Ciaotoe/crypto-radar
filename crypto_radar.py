@@ -267,17 +267,21 @@ def fetch_news_headlines():
 # AI 复核间隔(小时): 消息面变化通常数小时内兑现到价格, 2h 在轧空等快速
 # 行情里能抢在排列翻转前提醒(2026-10-19 与用户确认 4h 太久)。可经环境变量调整
 AI_REVIEW_HOURS = float(os.getenv("RADAR_AI_REVIEW_HOURS", "2"))
-_sig_last_review = {}  # {signal_id: iso时间} 复核节流, 不落盘(丢一次无碍)
+# 复核节流时间戳存档案字段 last_ai_review(进程内字典会随 job 内每轮巡检清零)
 
 
 def review_signals_with_ai(store, events):
     """在持信号每 AI_REVIEW_HOURS 做一次消息面复核(真正看新闻的那一层)。
     机械规则覆盖不到的阴跌/消息面异动, 由大模型基于头条+费率+FNG 判断;
-    只产出 alert 事件, 结案权仍在机械层。API 调用有节流, 无单时不调用。"""
+    只产出 alert 事件, 结案权仍在机械层。API 调用有节流, 无单时不调用。
+
+    节流时间戳必须落盘到档案(last_ai_review): job 内循环每轮巡检都是
+    新 python 进程, 进程内字典会清零, 落盘前实测每 20 分钟就复核一次。
+    """
     now = datetime.now(tracker.BJ_TZ)
     to_review = []
     for s in open_signals(store):
-        last = _sig_last_review.get(s['id'])
+        last = s.get('last_ai_review')
         if last is None or now - datetime.fromisoformat(last) >= timedelta(hours=AI_REVIEW_HOURS):
             to_review.append(s)
     if not to_review:
@@ -285,7 +289,7 @@ def review_signals_with_ai(store, events):
     heads = fetch_news_headlines()
     fng = get_macro_sentiment()
     for s in to_review:
-        _sig_last_review[s['id']] = now.isoformat()
+        s['last_ai_review'] = now.isoformat()
         try:
             d = get_market_data(s['symbol'])
             verdict = ask_ai_review(s, d, heads, fng)

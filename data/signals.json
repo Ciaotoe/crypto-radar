@@ -16,7 +16,8 @@
       "exit_reason": "trend_reversed",
       "strategy": null,
       "tp1_hit": false,
-      "alerts_fired": []
+      "alerts_fired": [],
+      "last_ai_review": null
     },
     {
       "id": "ETH/USDT-short-2026-10-18",
@@ -36,7 +37,8 @@
       "tp1_hit": false,
       "alerts_fired": [
         "drawdown"
-      ]
+      ],
+      "last_ai_review": null
     },
     {
       "id": "SOL/USDT-short-2026-10-18",
@@ -56,7 +58,8 @@
       "tp1_hit": false,
       "alerts_fired": [
         "drawdown"
-      ]
+      ],
+      "last_ai_review": null
     },
     {
       "id": "BTC/USDT-short-2026-10-19",
@@ -74,7 +77,8 @@
       "exit_reason": "trend_reversed",
       "strategy": null,
       "tp1_hit": false,
-      "alerts_fired": []
+      "alerts_fired": [],
+      "last_ai_review": null
     },
     {
       "id": "ETH/USDT-short-2026-10-19",
@@ -92,7 +96,8 @@
       "strategy": null,
       "exit_reason": "manual_reset",
       "tp1_hit": false,
-      "alerts_fired": []
+      "alerts_fired": [],
+      "last_ai_review": null
     },
     {
       "id": "SOL/USDT-short-2026-10-19",
@@ -110,7 +115,8 @@
       "strategy": null,
       "exit_reason": "manual_reset",
       "tp1_hit": false,
-      "alerts_fired": []
+      "alerts_fired": [],
+      "last_ai_review": null
     },
     {
       "id": "SOL/USDT-short-2026-10-19T12:05",
@@ -129,9 +135,9 @@
       "tp1_hit": false,
       "last_price": 104.68,
       "alerts_fired": [
-        "ai_review",
         "ai_review"
-      ]
+      ],
+      "last_ai_review": null
     }
   ]
 }

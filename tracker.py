@@ -81,6 +81,7 @@ def load_signals():
         sig.setdefault('exit_reason', None)
         sig.setdefault('tp1_hit', False)
         sig.setdefault('alerts_fired', [])
+        sig.setdefault('last_ai_review', None)  # AI 消息面复核节流(2026-10-19)
     return store
 
 
