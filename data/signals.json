@@ -111,6 +111,24 @@
       "exit_reason": "manual_reset",
       "tp1_hit": false,
       "alerts_fired": []
+    },
+    {
+      "id": "SOL/USDT-short-2026-10-19T12:05",
+      "symbol": "SOL/USDT",
+      "direction": "short",
+      "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
+      "entry_price": 105.16,
+      "strategy": null,
+      "triggered_at": "2026-10-19T12:05:41.207740+08:00",
+      "last_checked_at": "2026-10-19T12:05:41.207740+08:00",
+      "status": "active",
+      "exit_reason": null,
+      "pnl_now": 0.0,
+      "mfe": 0.0,
+      "mae": 0.0,
+      "tp1_hit": false,
+      "last_price": 105.16,
+      "alerts_fired": []
     }
   ]
 }
