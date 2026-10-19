@@ -62,3 +62,12 @@
   统一 setdefault 补齐(strategy/exit_reason/tp1_hit/alerts_fired)
 - dry-run 删掉一次 15m 扫描的 span 截断防御: startTime 由档案时间戳推导,
   无真实触发场景
+
+## 第二轮: 一次只推一个策略 + 巡检节奏修复(2026-10-19)
+- [x] 多候选择优(4H ADX, 并列取贴近 EMA20) + 有在持不推新策略
+- [x] 旧单全清(manual_reset), 重新开始找机会
+- [x] Actions cron 丢拍确认: scheduled 实测中位间隔 144 分钟(免费仓库
+      高频 cron 被调度器延迟/丢弃), 改 job 内 3 轮循环 + sleep 1200,
+      每小时 :03 拉起接力
+- 遗留: Gemini 返回未过点位校验时 strategy 为 null(退化机械追踪),
+  已加诊断日志待下条新策略触发时定位原因
