@@ -8,12 +8,16 @@
       "entry_price": 81894.23,
       "triggered_at": "2026-10-18T12:06:57.355906+08:00",
       "last_checked_at": "2026-10-19T09:45:31.893302+08:00",
-      "status": "invalid",
+      "status": "exited",
       "pnl_now": -0.764,
       "mfe": 1.159,
       "mae": -0.764,
       "last_price": 82519.68,
-      "invalid_reason": "4H 空头排列已破坏"
+      "invalid_reason": "4H 空头排列已破坏",
+      "exit_reason": "trend_reversed",
+      "strategy": null,
+      "tp1_hit": false,
+      "alerts_fired": []
     },
     {
       "id": "ETH/USDT-short-2026-10-18",
@@ -22,13 +26,19 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 2423.12,
       "triggered_at": "2026-10-18T12:07:06.880982+08:00",
-      "last_checked_at": "2026-10-19T09:45:31.893302+08:00",
+      "last_checked_at": "2026-10-19T10:10:58.578597+08:00",
       "status": "active",
-      "pnl_now": -0.175,
+      "pnl_now": -0.261,
       "mfe": 2.676,
-      "mae": -0.175,
-      "last_price": 2427.36,
-      "invalid_reason": null
+      "mae": -0.284,
+      "last_price": 2429.44,
+      "invalid_reason": null,
+      "strategy": null,
+      "exit_reason": null,
+      "tp1_hit": false,
+      "alerts_fired": [
+        "drawdown"
+      ]
     },
     {
       "id": "SOL/USDT-short-2026-10-18",
@@ -37,13 +47,19 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 104.34,
       "triggered_at": "2026-10-18T12:07:20.801194+08:00",
-      "last_checked_at": "2026-10-19T09:45:31.893302+08:00",
+      "last_checked_at": "2026-10-19T10:10:58.578597+08:00",
       "status": "active",
-      "pnl_now": -0.518,
+      "pnl_now": -1.083,
       "mfe": 2.799,
-      "mae": -0.518,
-      "last_price": 104.88,
-      "invalid_reason": null
+      "mae": -1.093,
+      "last_price": 105.47,
+      "invalid_reason": null,
+      "strategy": null,
+      "exit_reason": null,
+      "tp1_hit": false,
+      "alerts_fired": [
+        "drawdown"
+      ]
     },
     {
       "id": "BTC/USDT-short-2026-10-19",
@@ -53,12 +69,16 @@
       "entry_price": 82087.64,
       "triggered_at": "2026-10-19T07:41:01.694530+08:00",
       "last_checked_at": "2026-10-19T09:45:31.893302+08:00",
-      "status": "invalid",
+      "status": "exited",
       "pnl_now": -0.526,
       "mfe": 0.0,
       "mae": -0.526,
       "last_price": 82519.68,
-      "invalid_reason": "4H 空头排列已破坏"
+      "invalid_reason": "4H 空头排列已破坏",
+      "exit_reason": "trend_reversed",
+      "strategy": null,
+      "tp1_hit": false,
+      "alerts_fired": []
     },
     {
       "id": "ETH/USDT-short-2026-10-19",
@@ -67,13 +87,17 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 2407.44,
       "triggered_at": "2026-10-19T07:41:12.318117+08:00",
-      "last_checked_at": "2026-10-19T09:45:31.893302+08:00",
+      "last_checked_at": "2026-10-19T10:10:58.578597+08:00",
       "status": "active",
-      "pnl_now": -0.827,
+      "pnl_now": -0.916,
       "mfe": 0.0,
-      "mae": -0.827,
-      "last_price": 2427.36,
-      "invalid_reason": null
+      "mae": -0.937,
+      "last_price": 2429.49,
+      "invalid_reason": null,
+      "strategy": null,
+      "exit_reason": null,
+      "tp1_hit": false,
+      "alerts_fired": []
     },
     {
       "id": "SOL/USDT-short-2026-10-19",
@@ -82,13 +106,17 @@
       "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
       "entry_price": 104.15,
       "triggered_at": "2026-10-19T07:41:22.240190+08:00",
-      "last_checked_at": "2026-10-19T09:45:31.893302+08:00",
+      "last_checked_at": "2026-10-19T10:10:58.578597+08:00",
       "status": "active",
-      "pnl_now": -0.701,
+      "pnl_now": -1.277,
       "mfe": 0.0,
-      "mae": -0.701,
-      "last_price": 104.88,
-      "invalid_reason": null
+      "mae": -1.287,
+      "last_price": 105.48,
+      "invalid_reason": null,
+      "strategy": null,
+      "exit_reason": null,
+      "tp1_hit": false,
+      "alerts_fired": []
     }
   ],
   "last_summary_hour": "2026-10-19 09"
