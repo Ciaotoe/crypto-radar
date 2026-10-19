@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import pandas as pd
 import pandas_ta as ta
@@ -32,6 +33,23 @@ def fetch_klines(symbol, interval, limit):
     df = pd.DataFrame([row[:6] for row in rows],
                       columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     return df.astype(float)
+
+def fetch_klines_since(symbol, interval, start_ms):
+    """从币安镜像拉取 start_ms(毫秒时间戳)之后的 K 线, 供追踪模块扫描
+    上次检查以来的插针。窗口上限按 24h(Actions 故障重启后兜底)。"""
+    pair = symbol.replace('/', '')
+    res = requests.get(
+        f"{BINANCE_MIRROR}/api/v3/klines",
+        params={"symbol": pair, "interval": interval,
+                "startTime": start_ms, "limit": 96},
+        timeout=15,
+    )
+    res.raise_for_status()
+    rows = res.json()
+    df = pd.DataFrame([row[:6] for row in rows],
+                      columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    return df.astype(float)
+
 
 def fetch_funding_rate(symbol):
     """从 OKX 公开接口获取同品种 U 本位永续实时资金费率, 失败返回 0"""
@@ -124,7 +142,8 @@ def check_signal(data):
 
 # ================= 4. AI 极简策略生成与飞书推送 =================
 def generate_ai_strategy(data, signal_type, fng):
-    """调用 Gemini 原生 REST 接口生成直接、简练的执行策略"""
+    """调用 Gemini 生成执行策略。要求严格 JSON 输出, 供追踪模块存档点位;
+    解析或点位校验失败时返回 (纯文本, None), 信号走无点位机械追踪。"""
     prompt = f"""
 你是一个实战派加密货币交易参谋。当前监控程序捕捉到一个确定性交易机会，请根据以下币安实时数据直接给出交易策略。
 要求：极度精炼、拒绝废话，直接给点位和简短原因！
@@ -136,13 +155,16 @@ def generate_ai_strategy(data, signal_type, fng):
 - 1H 点位指标：RSI={data['1h_rsi']}, ATR波动率=${data['1h_atr']}, 过去24h高低点=${data['24h_low']} - ${data['24h_high']}
 - 合约资金费率：{data['funding_rate_pct']}% | 市场恐慌贪婪指数：{fng}
 
-请严格按以下格式输出（不要多余寒暄）：
-【方向】：做多 / 做空
-【建议入场】：具体价格区间
-【硬止损位】：具体价格（参考1.5倍ATR或结构位，注明亏损百分比）
-【分批止盈】：TP1 价格 / TP2 价格（确保盈亏比大于 1:2）
-【时间预期】：X 小时内应脱离成本区，若超时横盘怎么处理
-【核心逻辑】：用 2 句话简明扼要说明制定该策略的原因（结合趋势、点位与资金费率）。
+请严格按以下 JSON 格式输出（不要输出 JSON 以外的任何文字，不要用 markdown 代码块包裹）：
+{{
+  "direction": "做空",
+  "entry": "建议入场价格区间",
+  "stop": 硬止损位数字（参考1.5倍ATR或结构位，须能注明亏损百分比）,
+  "tp1": 第一止盈位数字（确保盈亏比大于 1:2）,
+  "tp2": 第二止盈位数字,
+  "time_expect": "X 小时内应脱离成本区，若超时横盘怎么处理",
+  "logic": "用 2 句话简明扼要说明制定该策略的原因（结合趋势、点位与资金费率）"
+}}
 """
     # Gemini 原生 REST 接口, 无需 SDK; 模型可经 GEMINI_MODEL 环境变量覆盖
     model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
@@ -152,7 +174,49 @@ def generate_ai_strategy(data, signal_type, fng):
         timeout=60,
     )
     resp.raise_for_status()
-    return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return parse_strategy(raw, data, signal_type)
+
+
+def parse_strategy(raw, data, signal_type):
+    """解析 Gemini JSON 输出。返回 (推送文案, 策略点位dict或None)。
+    点位校验: 方向与触发信号一致, stop/tp1/tp2 均为正数且方向关系正确
+    (做空: stop>现价>tp1>tp2; 做多: stop<现价<tp1<tp2), 不满足则视为无点位。"""
+    try:
+        # 容错: 模型偶尔会用 ```json 包裹
+        body = raw.strip('`')
+        if body.startswith('json'):
+            body = body[4:]
+        obj = json.loads(body)
+        direction = 'long' if '做多' in obj['direction'] else 'short'
+        stop, tp1, tp2 = (float(obj[k]) for k in ('stop', 'tp1', 'tp2'))
+        price = data['price']
+        expect_long = '做多' in signal_type
+        if direction == ('long' if expect_long else 'short') and \
+           ((direction == 'short' and stop > price > tp1 > tp2) or
+            (direction == 'long' and stop < price < tp1 < tp2)):
+            strategy = {"stop": stop, "tp1": tp1, "tp2": tp2,
+                        "text": raw}
+            text = format_strategy_text(obj, data)
+            return text, strategy
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+    # 退化为纯文本: 无点位档案, 该信号走机械追踪(无法判定止损/止盈离场)
+    return raw, None
+
+
+def format_strategy_text(obj, data):
+    """由代码把 JSON 渲染成与旧版观感一致的推送文案"""
+    d = "做多 🟢" if obj['direction'] == '做多' else "做空 🔴"
+    stop_loss_pct = abs(obj['stop'] - data['price']) / data['price'] * 100
+    return (
+        f"【方向】：{d}\n"
+        f"【建议入场】：{obj['entry']}\n"
+        f"【硬止损位】：{obj['stop']:.2f}（约亏 {stop_loss_pct:.1f}%）\n"
+        f"【分批止盈】：TP1 {obj['tp1']:.2f} / TP2 {obj['tp2']:.2f}（TP1 到位可减仓保本）\n"
+        f"【时间预期】：{obj['time_expect']}\n"
+        f"【核心逻辑】：{obj['logic']}"
+    )
 
 def send_telegram_msg(symbol, price, signal_type, strategy_text):
     """推送 TG 消息 (HTML 排版, 规避 Markdown 转义坑)"""
@@ -174,26 +238,63 @@ def send_telegram_msg(symbol, price, signal_type, strategy_text):
     resp.raise_for_status()
 
 def open_signals(store):
-    """返回所有未机械关闭(仍在追踪)的信号"""
-    return [s for s in store['signals'] if s['status'] != 'closed']
+    """返回所有未结案(仍在追踪)的信号"""
+    return [s for s in store['signals'] if s['status'] == 'active']
 
 
-def send_tracking_summary(store):
-    """推送追踪中信号的表现摘要(每小时至多一条; 无未关闭信号则不推)"""
-    open_sigs = open_signals(store)
-    if not open_sigs:
+def send_event_notice(events):
+    """事件驱动推送: 离场结案与预警合并成一条, 平时完全静默(2026-10-19 用户确认)。
+    - 紧急(排列翻转但止损未触): ⚠️ 提示立刻决策离场, 单独成段置顶;
+    - 普通结案: 📋 一行结算(原因+最终浮盈+峰值), 供长期衡量;
+    - 预警(不结案): ⚠️ 一行, 提示不对劲但策略点位仍有效。
+    """
+    if not events:
         return
-    lines = ["📊 <b>信号追踪摘要</b>"]
-    for s in sorted(open_sigs, key=lambda x: x['triggered_at']):
-        emoji = "🟢" if s['direction'] == 'long' else "🔴"
-        trig = s['triggered_at'][:16]
-        status_txt = {"active": "趋势成立", "invalid": "⚠️趋势已翻转"}[s['status']]
+    urgent, exits, alerts = [], [], []
+    for e in events:
+        if e['type'] == 'exit':
+            if e.get('urgent'):
+                urgent.append(e)
+            else:
+                exits.append(e)
+        else:
+            alerts.append(e)
+    lines = []
+    for e in urgent:
+        s = e['sig']
         lines.append(
-            f"{emoji} {s['symbol']} {'做多' if s['direction'] == 'long' else '做空'}"
-            f" @{s['entry_price']} ({trig})\n"
-            f"现价 {s['last_price']} | 浮盈 {s['pnl_now']:+.2f}%"
-            f" | 峰值 {s['mfe']:+.2f}% | 最差 {s['mae']:+.2f}% | {status_txt}"
+            f"⚠️ <b>{s['symbol']} 趋势排列已翻转但止损未触发</b>\n"
+            f"{'做空' if s['direction'] == 'short' else '做多'} @{s['entry_price']} "
+            f"现价 {s['last_price']} (浮盈 {s['pnl_now']:+.2f}%, 止损位 {s['strategy']['stop']})\n"
+            f"止损单不会保护你——别等止损, 尽快人工决策离场。"
         )
+    if exits:
+        lines.append("📋 <b>信号结案</b>")
+        for e in exits:
+            s = e['sig']
+            reason = {
+                'stopped_out': "触及止损离场", 'took_profit': "止盈离场",
+                'trend_reversed': "趋势翻转离场", 'timeout': "追踪满48h关闭",
+            }[e['reason']]
+            mech = "" if s.get('strategy') else "（无点位存档, 机械口径）"
+            lines.append(
+                f"{s['symbol']} {'做空' if s['direction'] == 'short' else '做多'}"
+                f" @{s['entry_price']}: {reason} | 最终 {s['pnl_now']:+.2f}%"
+                f" | 峰值 {s['mfe']:+.2f}%{mech}"
+            )
+    if alerts:
+        lines.append("⚠️ <b>预警</b>")
+        for e in alerts:
+            s = e['sig']
+            if e['reason'] == 'drawdown':
+                detail = (f"浮盈大幅回吐: 峰值 {s['mfe']:+.2f}% -> 现 {s['pnl_now']:+.2f}%, "
+                          f"注意离场时机")
+            else:
+                detail = "4H ADX 跌破 22, 趋势动能消散, 留意假突破"
+            lines.append(
+                f"{s['symbol']} {'做空' if s['direction'] == 'short' else '做多'}"
+                f" @{s['entry_price']}: {detail}"
+            )
     requests.post(
         f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
         json={"chat_id": TG_CHAT_ID, "text": "\n\n".join(lines), "parse_mode": "HTML"},
@@ -205,12 +306,11 @@ def run_scan():
     if not TG_BOT_TOKEN or not TG_CHAT_ID or not GEMINI_API_KEY:
         raise SystemExit("TG_BOT_TOKEN / TG_CHAT_ID / GEMINI_API_KEY 未设置")
 
-    # 先更新历史信号档案
+    # 先更新历史信号档案: 结案/预警事件攒起来最后合并推一条
     store = tracker.load_signals()
-    tracking_changed = tracker.update_open_signals(store, get_market_data)
+    _, events = tracker.update_open_signals(store, get_market_data, fetch_klines_since)
 
     fng = get_macro_sentiment()
-    new_pushed = False
     for sym in SYMBOLS:
         try:
             data = get_market_data(sym)
@@ -218,29 +318,26 @@ def run_scan():
             if signal:
                 sig = tracker.record_new_signal(store, data, signal)
                 if sig is None:
-                    # 同日同向信号已在追踪, 不重复推新策略, 只更新档案
+                    # 同币种同方向已有未结案信号在追踪, 不重复推新策略, 只更新档案
                     print(f"[{sym}] 信号持续成立(已在追踪), 不重复推送")
                     continue
                 print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送 TG...")
-                strategy = generate_ai_strategy(data, signal, fng)
-                send_telegram_msg(sym, data['price'], signal, strategy)
+                strategy_text, strategy = generate_ai_strategy(data, signal, fng)
+                send_telegram_msg(sym, data['price'], signal, strategy_text)
                 # 推送成功才正式建档: 失败时回退, 下次巡检信号仍成立会重试推送
+                sig['strategy'] = strategy
                 store['signals'].append(sig)
-                new_pushed = True
             else:
                 print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
         except Exception as e:
             print(f"[{sym}] 扫描异常: {e}")
 
-    # 每小时至多推一条追踪摘要: 按档案记录上次推送的小时,
-    # 本小时未推过且有未关闭信号就推(错过 :05 会在 :25/:45 补上)
-    hour_now = tracker._now().strftime('%Y-%m-%d %H')
-    if open_signals(store) and store.get('last_summary_hour') != hour_now:
+    # 事件驱动推送: 有结案/预警才发, 平时完全静默
+    if events:
         try:
-            send_tracking_summary(store)
-            store['last_summary_hour'] = hour_now
+            send_event_notice(events)
         except Exception as e:
-            print(f"追踪摘要推送失败: {e}")
+            print(f"事件通知推送失败: {e}")
 
     tracker.save_signals(store)
 
