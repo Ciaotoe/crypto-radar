@@ -199,8 +199,10 @@ def parse_strategy(raw, data, signal_type):
                         "text": raw}
             text = format_strategy_text(obj, data)
             return text, strategy
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        pass
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+        # Actions 日志里可见失败原因, 便于调整 prompt/校验规则
+        print(f"[parse_strategy] JSON 解析/校验失败: {type(e).__name__}: {e}")
+        print(f"[parse_strategy] 原始返回前500字: {raw[:500]}")
     # 退化为纯文本: 无点位档案, 该信号走机械追踪(无法判定止损/止盈离场)
     return raw, None
 
