@@ -2,7 +2,9 @@ name: crypto-radar
 
 on:
   schedule:
-    - cron: '5,25,45 * * * *'  # 每小时三次, 错开整点排队高峰
+    # GitHub Actions 对高频 scheduled cron 会延迟/丢拍(实测中位间隔 144 分钟),
+    # 改为每小时拉起一次, 20 分钟节奏由 job 内循环保证
+    - cron: '3 * * * *'
   workflow_dispatch: {}  # 允许手动触发测试
 
 permissions:
@@ -11,7 +13,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -25,9 +27,17 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: uv run crypto_radar.py
+        # 单次巡检 20 秒左右, 每轮后 sleep 到下一档再跑, 共 3 轮约 1 小时,
+        # 由下一次 cron 拉起接力; 单轮异常不中断后续轮次
+        run: |
+          for i in 1 2 3; do
+            echo "=== 第 $i 轮巡检 $(date -u '+%Y-%m-%d %H:%M:%SZ') ==="
+            uv run crypto_radar.py || echo "第 $i 轮巡检失败, 继续下一轮"
+            if [ "$i" -lt 3 ]; then sleep 1200; fi
+          done
 
       # 仓库即数据库: 把信号档案变化提交回 main, 供下次运行读取
+      # 放循环外统一提交一次(轮内档案内存已连续更新, 落盘是最终状态)
       - name: Commit signal data
         run: |
           git config user.name "radar-bot"
