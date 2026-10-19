@@ -37,11 +37,14 @@ jobs:
           done
 
       # 仓库即数据库: 把信号档案变化提交回 main, 供下次运行读取
-      # 放循环外统一提交一次(轮内档案内存已连续更新, 落盘是最终状态)
+      # 放循环外统一提交一次(轮内档案内存已连续更新, 落盘是最终状态)。
+      # 巡检循环拉长了运行窗口, 与人工推送撞车概率变高: push 被拒时
+      # rebase 远端后重试(signals.json 是我们唯一改动的文件, 无真冲突)
       - name: Commit signal data
         run: |
           git config user.name "radar-bot"
           git config user.email "radar-bot@users.noreply.github.com"
           git add data/signals.json
           git diff --cached --quiet || git commit -m "data: update signal tracking [skip ci]"
+          git pull --rebase origin main
           git push
