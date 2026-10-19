@@ -242,6 +242,14 @@ def open_signals(store):
     return [s for s in store['signals'] if s['status'] == 'active']
 
 
+def pick_best_candidate(candidates):
+    """多个机会并存时只推一个(2026-10-19 用户要求一次只做一个策略):
+    按 4H ADX 择优 —— 趋势强度是初筛漏斗里确定性的核心来源;
+    并列时取价格更贴近 EMA20 的(回踩结构更好, 入场风险更小)。"""
+    return max(candidates, key=lambda c: (c[0]['4h_adx'],
+                                          -abs(c[0]['price'] - c[0]['4h_ema20'])))
+
+
 def send_event_notice(events):
     """事件驱动推送: 离场结案与预警合并成一条, 平时完全静默(2026-10-19 用户确认)。
     - 紧急(排列翻转但止损未触): ⚠️ 提示立刻决策离场, 单独成段置顶;
@@ -275,6 +283,7 @@ def send_event_notice(events):
             reason = {
                 'stopped_out': "触及止损离场", 'took_profit': "止盈离场",
                 'trend_reversed': "趋势翻转离场", 'timeout': "追踪满48h关闭",
+                'manual_reset': "人工清仓重置",
             }[e['reason']]
             mech = "" if s.get('strategy') else "（无点位存档, 机械口径）"
             lines.append(
@@ -311,26 +320,41 @@ def run_scan():
     _, events = tracker.update_open_signals(store, get_market_data, fetch_klines_since)
 
     fng = get_macro_sentiment()
+    # 全币种先扫描完再择优: 一次只推一个策略, 避免同时来好几单无从选择
+    candidates = []
     for sym in SYMBOLS:
         try:
             data = get_market_data(sym)
             signal = check_signal(data)
             if signal:
-                sig = tracker.record_new_signal(store, data, signal)
-                if sig is None:
-                    # 同币种同方向已有未结案信号在追踪, 不重复推新策略, 只更新档案
-                    print(f"[{sym}] 信号持续成立(已在追踪), 不重复推送")
-                    continue
-                print(f"[{sym}] 发现确定性机会: {signal}，正在生成策略并推送 TG...")
+                candidates.append((data, signal))
+                print(f"[{sym}] 发现确定性机会: {signal} (候选, 等待择优)")
+            else:
+                print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
+        except Exception as e:
+            print(f"[{sym}] 扫描异常: {e}")
+
+    # 手上有未结案信号 = 用户还在做这一个策略, 不推任何新策略(一次只搞一个)
+    if open_signals(store):
+        if candidates:
+            print(f"[*] 有候选机会 {len(candidates)} 个, 但当前有信号在追踪, 不推新策略")
+    elif candidates:
+        data, signal = pick_best_candidate(candidates)
+        sym = data['symbol']
+        try:
+            sig = tracker.record_new_signal(store, data, signal)
+            if sig is None:
+                # 理论上不会到这(无未结案信号才会进这分支), 兜底防止重复建档
+                print(f"[{sym}] 建档去重命中, 跳过")
+            else:
+                print(f"[{sym}] 择优胜出: {signal}，正在生成策略并推送 TG...")
                 strategy_text, strategy = generate_ai_strategy(data, signal, fng)
                 send_telegram_msg(sym, data['price'], signal, strategy_text)
                 # 推送成功才正式建档: 失败时回退, 下次巡检信号仍成立会重试推送
                 sig['strategy'] = strategy
                 store['signals'].append(sig)
-            else:
-                print(f"[{sym}] 当前价 ${data['price']} (4H ADX={data['4h_adx']}, 1H RSI={data['1h_rsi']}) -> 暂无高确定性趋势点位，继续静默监控。")
         except Exception as e:
-            print(f"[{sym}] 扫描异常: {e}")
+            print(f"[{sym}] 策略生成/推送异常: {e}")
 
     # 事件驱动推送: 有结案/预警才发, 平时完全静默
     if events:

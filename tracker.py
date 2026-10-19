@@ -71,8 +71,7 @@ def load_signals():
         if sig.get('status') in ('invalid', 'closed'):
             sig['status'] = 'exited'
             if not sig.get('exit_reason'):
-                reason = sig.get('invalid_reason') or ''
-                sig['exit_reason'] = TIMEOUT if '48' in reason else TREND_REVERSED
+                sig['exit_reason'] = TREND_REVERSED  # 旧档案已全部清仓重置, 兜底而已
         # 2026-10-19 新增字段: 旧信号无策略点位(strategy=None), 走机械追踪
         sig.setdefault('strategy', None)
         sig.setdefault('exit_reason', None)
