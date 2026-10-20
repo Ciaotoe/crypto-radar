@@ -157,3 +157,55 @@ def get_strategy_market_data(symbol):
                     "4h_ema20_prev", "4h_adx", "4h_di_plus", "4h_di_minus", "1h_rsi", "1h_atr", "1h_ema20"]):
         raise StrategyRejected("指标不完整")
     return data
+
+
+def signal_direction(data, now_ms=None):
+    """Require a completed retest and reversal, rather than mere EMA proximity."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if data.get("market") != MARKET:
+        raise StrategyRejected("策略需要 Binance USDT 永续行情")
+    if not 0 <= now_ms - positive(data.get("quoted_at_ms"), "报价时间") <= MAX_QUOTE_AGE_MS:
+        raise StrategyRejected("策略报价已过期")
+    if not 0 < now_ms - positive(data.get("signal_close_ms"), "确认时间") <= 45 * 60_000:
+        raise StrategyRejected("1H 确认已超过 45 分钟，等待新确认")
+    atr = positive(data.get("1h_atr"), "ATR")
+    price = positive(data.get("price"), "现价")
+    e20, e50, e200 = (positive(data.get(f"4h_ema{x}"), f"EMA{x}") for x in (20, 50, 200))
+    if data["4h_adx"] < 22:
+        raise StrategyRejected("4H ADX 低于趋势筛选阈值")
+    if e20 > e50 > e200 and data["4h_ema20_prev"] < e20 \
+       and data["4h_close"] > e20 and data["4h_di_plus"] > data["4h_di_minus"]:
+        direction, sign = "long", 1
+    elif e20 < e50 < e200 and data["4h_ema20_prev"] > e20 \
+         and data["4h_close"] < e20 and data["4h_di_minus"] > data["4h_di_plus"]:
+        direction, sign = "short", -1
+    else:
+        raise StrategyRejected("4H 均线、斜率或方向指标不一致")
+    bars = data["bars_1h"]
+    current, prev = bars.iloc[-1], bars.iloc[-2]
+    if len(bars) < 5 or current.high <= current.low:
+        raise StrategyRejected("回踩确认样本不足或无有效振幅")
+    rsi = data["1h_rsi"]
+    if direction == "long":
+        rsi_ok = 40 <= rsi <= 65 and rsi > prev.rsi
+        reversal = current.close > current.open and current.close > prev.high \
+                   and (current.close - current.low) / (current.high - current.low) >= .65
+    else:
+        rsi_ok = 35 <= rsi <= 60 and rsi < prev.rsi
+        reversal = current.close < current.open and current.close < prev.low \
+                   and (current.high - current.close) / (current.high - current.low) >= .65
+    if not rsi_ok or not reversal:
+        raise StrategyRejected("1H 未出现方向一致的收盘反转确认")
+    touched = False
+    for _, bar in bars.iloc[-4:].iterrows():
+        for ema in (bar.ema20, e20):
+            if bar.low <= ema + .25 * atr and bar.high >= ema - .25 * atr:
+                touched = True
+    if not touched or sign * (current.close - data["1h_ema20"]) <= 0:
+        raise StrategyRejected("没有均线回踩/反弹后收回的证据")
+    if abs(price - data["1h_ema20"]) > 1.5 * atr or abs(price - e20) > 2 * atr \
+       or abs(price - current.close) > .5 * atr \
+       or sign * (price - data["1h_ema20"]) <= 0 \
+       or sign * (price - prev.close) <= 0:
+        raise StrategyRejected("现价偏离确认区间或重新失守，放弃追价")
+    return direction
