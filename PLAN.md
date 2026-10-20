@@ -83,7 +83,7 @@
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_market.py' -v`；全部通过，覆盖未收盘 K 线不改变趋势指标、现价独立更新、行情缺失/过期拒绝发策略、费率缺失不当作零费率、EMA200 预热充足，以及所选交易市场的数据一致性。
 2. [x] 完善趋势方向、回踩/反弹确认与追价限制。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_signal.py' -v`；全部通过，覆盖多空确认、下跌未止/上涨未止拒绝、未触及支撑/阻力拒绝、偏离按 ATR 归一化、超时或价格跑远拒绝。
-3. [ ] 完善点位、交易成本、结构空间和仓位风险约束。
+3. [x] 完善点位、交易成本、结构空间和仓位风险约束。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_levels.py' -v`；全部通过，覆盖正数/有限数/方向校验、数字入场与建议一致、净 TP1 盈亏比至少 2:1、止损在结构外且不过宽/过窄、目标不越过已知反向结构、交易成本和账户风险上限计算正确、不合格 AI 输出拒绝推送。
 4. [ ] 接入候选择优、推送前复核并更新策略说明。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_flow.py' -v`；全部通过，覆盖不同币价候选使用可比较指标、首选失败不阻断其余合格候选、推送前失效拒绝、无有效策略不推送/不建新档案；`git diff --check` 无输出。

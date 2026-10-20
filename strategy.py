@@ -209,3 +209,142 @@ def signal_direction(data, now_ms=None):
        or sign * (price - prev.close) <= 0:
         raise StrategyRejected("现价偏离确认区间或重新失守，放弃追价")
     return direction
+
+
+def round_tick(price, tick, up=False):
+    rounding = ROUND_CEILING if up else ROUND_FLOOR
+    units = (Decimal(str(price)) / Decimal(str(tick))).to_integral_value(rounding=rounding)
+    return float(units * Decimal(str(tick)))
+
+
+def structure_boundary(data, direction, entry):
+    """Nearest observed obstacle, using confirmed pivots and the preceding 24h.
+
+    A pivot needs two closed candles on either side; today's still forming high
+    is never treated as a confirmed swing. Unknown space is not a target.
+    """
+    levels = []
+    key = "high" if direction == "long" else "low"
+    for frame in (data["bars_1h"].iloc[-168:], data["bars_4h"].iloc[-180:]):
+        values = frame[key].tolist()
+        for i in range(2, len(values) - 2):
+            neighbors = values[i-2:i] + values[i+1:i+3]
+            if (values[i] > max(neighbors) if direction == "long" else values[i] < min(neighbors)):
+                levels.append(values[i])
+    recent = data["bars_1h"].iloc[-25:-1][key]
+    levels.append(float(recent.max() if direction == "long" else recent.min()))
+    ahead = [x for x in levels if x > entry] if direction == "long" else [x for x in levels if x < entry]
+    if not ahead:
+        raise StrategyRejected("前方没有可确认的目标结构，暂不生成目标")
+    return min(ahead) if direction == "long" else max(ahead)
+
+
+def cost_per_unit(data, entry, exit_price, direction, hours=HOLD_HOURS):
+    """Estimate both taker fees/slippage plus adverse funding, no funding credit.
+
+    The latest funding rate can change. One additional settlement is reserved;
+    this is a cost estimate, not a guaranteed limit on future funding or gaps.
+    """
+    interval = positive(data.get("funding_interval_hours"), "资金周期")
+    rate = float(data["funding_rate"])
+    if not math.isfinite(rate):
+        raise StrategyRejected("费率不可用")
+    adverse_rate = max(rate if direction == "long" else -rate, 0)
+    settlements = math.ceil(hours / interval) + 1
+    return (entry + exit_price) * (TAKER_FEE + SLIPPAGE) + entry * adverse_rate * settlements
+
+
+def risk_size(plan, equity):
+    equity = positive(equity, "账户权益")
+    loss = positive(plan.get("loss_per_unit"), "每单位预计止损损失")
+    entry = positive(plan.get("entry_max"), "入场上界")
+    qty = min(equity * ACCOUNT_RISK / loss, equity * MAX_NOTIONAL_EQUITY / entry,
+              positive(plan.get("max_qty"), "最大下单量"))
+    qty = round_tick(qty, positive(plan.get("qty_step"), "数量步长"))
+    if qty < plan["min_qty"] or qty * plan["entry_min"] < plan["min_notional"]:
+        raise StrategyRejected("账户权益对应的风险额度不足最小下单要求；不可加仓凑单")
+    return {"qty": qty, "estimated_loss": qty * loss,
+            "notional_max": qty * entry, "account_risk_pct": qty * loss / equity * 100}
+
+
+def validate_plan(plan, data):
+    if plan.get("direction") not in ("long", "short"):
+        raise StrategyRejected("方向必须明确为 long 或 short")
+    fields = ["entry", "entry_min", "entry_max", "stop", "tp1", "tp2", "hold_hours", "structure_boundary"]
+    values = {key: positive(plan.get(key), key) for key in fields}
+    side = plan["direction"]
+    low, high = values["entry_min"], values["entry_max"]
+    if not low <= values["entry"] <= high or not 6 <= values["hold_hours"] <= 24:
+        raise StrategyRejected("入场区间或持仓时间不合理")
+    if side == "long":
+        ordered = values["stop"] < low <= high < values["tp1"] < values["tp2"] < values["structure_boundary"]
+        worst = high
+        structure = float(data["bars_1h"].low.iloc[-4:].min())
+        beyond_structure = values["stop"] <= structure - .25 * data["1h_atr"] + 1e-9
+    else:
+        ordered = values["stop"] > high >= low > values["tp1"] > values["tp2"] > values["structure_boundary"]
+        worst = low
+        structure = float(data["bars_1h"].high.iloc[-4:].max())
+        beyond_structure = values["stop"] >= structure + .25 * data["1h_atr"] - 1e-9
+    if not ordered or not beyond_structure:
+        raise StrategyRejected("点位方向、结构外止损或目标空间不合格")
+    risk = abs(worst - values["stop"])
+    minrisk = min(abs(low-values["stop"]), abs(high-values["stop"]))
+    atr = positive(data["1h_atr"], "ATR")
+    if minrisk < 1.5 * atr - 1e-9 or risk > 3 * atr + 1e-9 or risk / worst > .03:
+        raise StrategyRejected("止损须至少 1.5 ATR、至多 3 ATR，且不超过价格的 3%")
+    loss = risk + cost_per_unit(data, worst, values["stop"], side, values["hold_hours"])
+    reward = abs(values["tp1"]-worst) - cost_per_unit(data, worst, values["tp1"], side, values["hold_hours"])
+    if reward / loss < MIN_NET_RR - 1e-9:
+        raise StrategyRejected("最不利入场价扣成本后 TP1 盈亏比不足 2:1")
+    actual_boundary = structure_boundary(data, side, worst)
+    if values["structure_boundary"] != actual_boundary:
+        raise StrategyRejected("目标结构与行情证据不一致")
+    if any(abs(x - round_tick(x, data["tick_size"])) > 1e-8 for x in [values["stop"], values["tp1"], values["tp2"], low, high]):
+        raise StrategyRejected("点位不符合 Binance 价格步长")
+    return {"loss_per_unit": loss, "net_rr": reward / loss,
+            "estimated_cost_per_unit": cost_per_unit(data, worst, values["stop"], side)}
+
+
+def build_plan(data, direction=None):
+    confirmed = signal_direction(data)
+    if direction is not None and direction != confirmed:
+        raise StrategyRejected("点位方向与确认信号不一致")
+    direction = confirmed
+    sign = 1 if direction == "long" else -1
+    atr, tick = data["1h_atr"], data["tick_size"]
+    entry = data["ask"] if direction == "long" else data["bid"]
+    if data["ask"] - data["bid"] > .1 * atr or abs(data["mark_price"]-data["price"]) > .25 * atr:
+        raise StrategyRejected("买卖价差或标记价偏离过大")
+    # This is an immediate-entry setup, not an unconfirmed future limit order.
+    lower = round_tick(entry - .1 * atr, tick, up=True)
+    upper = round_tick(entry + .1 * atr, tick)
+    if lower > upper or abs(entry-data["price"]) > .1 * atr:
+        raise StrategyRejected("入场报价无有效区间")
+    worst = upper if direction == "long" else lower
+    structure = float(data["bars_1h"]["low" if direction == "long" else "high"].iloc[-4:].agg("min" if direction == "long" else "max"))
+    stop = min(structure-.25*atr, lower-1.5*atr) if direction == "long" else max(structure+.25*atr, upper+1.5*atr)
+    stop = round_tick(stop, tick, up=direction == "short")
+    boundary = structure_boundary(data, direction, worst)
+    risk = abs(worst-stop)
+    if risk > 3 * atr + 1e-9 or risk / worst > .03:
+        raise StrategyRejected("止损须不超过 3 ATR 及价格的 3%")
+    loss = risk + cost_per_unit(data, worst, stop, direction)
+    rate = max(data["funding_rate"] * sign, 0) * (math.ceil(HOLD_HOURS/data["funding_interval_hours"])+1)
+    targets = []
+    for rr in (2., 3.):
+        # Solve net reward = rr * net stop loss, including price-dependent exit fee.
+        desired = (rr*loss + worst*(2*(TAKER_FEE+SLIPPAGE)+rate)) / (1-sign*(TAKER_FEE+SLIPPAGE))
+        targets.append(round_tick(worst + sign*desired, tick, up=direction == "long"))
+    if sign * (boundary - targets[1]) < .25 * atr:
+        raise StrategyRejected("已知支撑/阻力前的空间不足以容纳净 2R/3R 目标")
+    plan = {"direction": direction, "entry": entry, "entry_min": lower, "entry_max": upper,
+            "stop": stop, "tp1": targets[0], "tp2": targets[1],
+            "structure_boundary": boundary, "hold_hours": HOLD_HOURS,
+            "timeout_action": "人工复核剩余仓位，信号走弱则退出；不因横盘扩大止损",
+            "signal_close_ms": data["signal_close_ms"], "created_at_ms": int(time.time()*1000),
+            "market": MARKET, "stop_trigger": "CONTRACT_PRICE",
+            "account_risk_pct": ACCOUNT_RISK * 100,
+            **{key: data[key] for key in ["qty_step", "min_qty", "max_qty", "min_notional"]}}
+    plan.update(validate_plan(plan, data))
+    return plan
