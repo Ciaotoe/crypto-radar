@@ -338,7 +338,8 @@ def build_plan(data, direction=None):
         targets.append(round_tick(worst + sign*desired, tick, up=direction == "long"))
     if sign * (boundary - targets[1]) < .25 * atr:
         raise StrategyRejected("已知支撑/阻力前的空间不足以容纳净 2R/3R 目标")
-    plan = {"direction": direction, "entry": entry, "entry_min": lower, "entry_max": upper,
+    plan = {"symbol": data["symbol"], "direction": direction, "entry": entry,
+            "entry_min": lower, "entry_max": upper,
             "stop": stop, "tp1": targets[0], "tp2": targets[1],
             "structure_boundary": boundary, "hold_hours": HOLD_HOURS,
             "timeout_action": "人工复核剩余仓位，信号走弱则退出；不因横盘扩大止损",
@@ -348,3 +349,72 @@ def build_plan(data, direction=None):
             **{key: data[key] for key in ["qty_step", "min_qty", "max_qty", "min_notional"]}}
     plan.update(validate_plan(plan, data))
     return plan
+
+
+def candidate_score(data):
+    """候选择优打分, 跨币价可比(2026-10-20): 4H ADX 优先, 并列时取回踩
+    更贴近 4H EMA20 的。贴近度按 1H ATR 归一 —— 绝对价差在 BTC 与 SOL
+    之间不可比, 旧口径的 abs(price - ema20) 会让高价币永远输给低价币。"""
+    atr = positive(data["1h_atr"], "ATR")
+    ema = positive(data["4h_ema20"], "EMA20")
+    price = positive(data["price"], "现价")
+    return positive(data["4h_adx"], "ADX"), -abs(price - ema) / atr
+
+
+def build_from_candidates(candidates):
+    """按可比指标择优逐个构建点位计划; 首选被拒不阻断其余合格候选。
+    返回 (plan, data, attempts); 全部不合格时 plan 为 None,
+    attempts 收集每个候选的拒绝原因, 供日志与只读检查输出。"""
+    attempts = []
+    for data in sorted(candidates, key=candidate_score, reverse=True):
+        try:
+            return build_plan(data), data, attempts
+        except StrategyRejected as exc:
+            attempts.append((data["symbol"], str(exc)))
+    return None, None, attempts
+
+
+def ensure_pushable(plan, fresh):
+    """推送前复核: 用推送时刻的新行情重新确认信号仍成立、现价仍在计划
+    入场区间内。任一不满足即拒绝本轮推送 —— 计划失效就放弃, 不现场改点位。"""
+    if signal_direction(fresh) != plan["direction"]:
+        raise StrategyRejected("确认方向已改变，计划失效")
+    price = positive(fresh["price"], "现价")
+    if not plan["entry_min"] <= price <= plan["entry_max"]:
+        raise StrategyRejected("现价已离开计划入场区间，本轮放弃推送")
+    return fresh
+
+
+def format_strategy_text(plan):
+    """由代码把点位计划渲染成推送文案(观感与旧版一致); 点位全由规则生成,
+    文案不再经过模型, 推送内容与存档点位不会出现两个口径。"""
+    long_side = plan["direction"] == "long"
+    d = "做多 🟢" if long_side else "做空 🔴"
+    worst = plan["entry_max"] if long_side else plan["entry_min"]
+    stop_pct = abs(worst - plan["stop"]) / worst * 100
+    return (
+        f"【方向】：{d}\n"
+        f"【建议入场】：{plan['entry_min']:.2f} – {plan['entry_max']:.2f}"
+        f"（现价即时入场，超出区间不追）\n"
+        f"【硬止损位】：{plan['stop']:.2f}（最不利入场约亏 {stop_pct:.1f}%）\n"
+        f"【分批止盈】：TP1 {plan['tp1']:.2f} / TP2 {plan['tp2']:.2f}"
+        f"（TP1 到位可减仓保本）\n"
+        f"【时间预期】：{plan['hold_hours']:.0f} 小时内应脱离成本区；"
+        f"超时则{plan['timeout_action']}\n"
+        f"【核心逻辑】：4H 趋势排列与动能一致，1H 回踩均线后出现同向收盘"
+        f"反转确认；止损置于近端结构之外，目标按净盈亏比 2R/3R 预设，"
+        f"前方已确认结构边界 {plan['structure_boundary']:.2f}。"
+        f"单笔风险不超过账户权益的 {plan['account_risk_pct']:.1f}%。"
+    )
+
+
+def simplify_plan(plan):
+    """追踪档案只存点位与预案; 完整文案存 text, 行情快照与中间计算量不落盘"""
+    return {"direction": plan["direction"], "stop": plan["stop"],
+            "tp1": plan["tp1"], "tp2": plan["tp2"],
+            "hold_hours": plan["hold_hours"],
+            "timeout_action": plan["timeout_action"],
+            "entry_min": plan["entry_min"], "entry_max": plan["entry_max"],
+            "net_rr": plan["net_rr"],
+            "account_risk_pct": plan["account_risk_pct"],
+            "text": format_strategy_text(plan)}

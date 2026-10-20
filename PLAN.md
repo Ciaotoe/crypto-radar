@@ -85,7 +85,7 @@
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_signal.py' -v`；全部通过，覆盖多空确认、下跌未止/上涨未止拒绝、未触及支撑/阻力拒绝、偏离按 ATR 归一化、超时或价格跑远拒绝。
 3. [x] 完善点位、交易成本、结构空间和仓位风险约束。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_levels.py' -v`；全部通过，覆盖正数/有限数/方向校验、数字入场与建议一致、净 TP1 盈亏比至少 2:1、止损在结构外且不过宽/过窄、目标不越过已知反向结构、交易成本和账户风险上限计算正确、不合格 AI 输出拒绝推送。
-4. [ ] 接入候选择优、推送前复核并更新策略说明。
+4. [x] 接入候选择优、推送前复核并更新策略说明。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_flow.py' -v`；全部通过，覆盖不同币价候选使用可比较指标、首选失败不阻断其余合格候选、推送前失效拒绝、无有效策略不推送/不建新档案；`git diff --check` 无输出。
 5. [ ] 完整验证与独立只读复核，记录实际限制并归档本轮计划。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy*.py' -v` 全部通过；公开行情只读检查能给出策略或明确拒绝原因，不调用 Telegram/实际订单接口、不改信号档案；按本轮计划逐项只读复核无遗漏。保存验证记录与必要项目规则后，每个完成步骤单独提交，不推送。
