@@ -126,20 +126,20 @@
       "entry_price": 105.16,
       "strategy": null,
       "triggered_at": "2026-10-19T12:05:41.207740+08:00",
-      "last_checked_at": "2026-10-20T08:04:26.472865+08:00",
+      "last_checked_at": "2026-10-20T12:33:24.964365+08:00",
       "status": "active",
       "exit_reason": null,
-      "pnl_now": 0.143,
+      "pnl_now": -0.105,
       "mfe": 1.541,
       "mae": -1.008,
       "tp1_hit": false,
-      "last_price": 105.01,
+      "last_price": 105.27,
       "alerts_fired": [
         "ai_review",
         "ai_review",
         "drawdown"
       ],
-      "last_ai_review": "2026-10-20T07:24:06.606005+08:00"
+      "last_ai_review": "2026-10-20T11:53:02.546438+08:00"
     }
   ]
 }
