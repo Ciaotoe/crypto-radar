@@ -116,3 +116,64 @@
   "报价过期"), 并 patch `crypto_radar` 模块级密钥属性; 已沉淀到项目 AGENTS.md。
 - 归档: 本轮计划完成, 保留上方追踪计划不动; 项目 AGENTS.md 已建, 记录架构
   边界、451 约束与测试要点。不推送, 由用户决定合并。
+
+## 第三轮: 迁移 OKX + 移植追踪改进(2026-10-21, 草案, 待用户确认)
+
+### 背景
+- 用户确认: 整个系统(行情源与实际交易市场)迁移到 OKX USDT 永续;
+  并采纳 external `new/` 版中 4 项追踪层真改进, 但**不采纳**其
+  crypto_radar 架构(回退 AI 生成点位/放弃成本校验等, 已评审为倒退)。
+- 用户确认(2026-10-21): 单一 OKX 数据源, 不做失败回退。
+- 本机实测 OKX v5 公开接口全部可用: candles/ticker/mark-price/
+  funding-rate/funding-rate-history/instruments, 无 451 限制。
+- 关键差异: OKX 合约为 ctVal 张数模式(BTC 1张=0.01 BTC), 数量单位
+  与 Binance 币本位不同; 费率每 8h 结算(ticker 实测 28800000ms 间隔)。
+
+### 目标
+- strategy.py 数据层整体换为 OKX v5, 单一行情源无回退(回退会重新引入
+  跨市场基差错位); 策略规则/点位生成/成本校验逻辑不变, 仅适配数据。
+- tracker.py 移植 4 项改进: TP1 后保本闭环(breakeven_after_tp1)、
+  _trend_ok 仅看已收盘 EMA20/50 排列、扫描窗口防开仓前插针、
+  AI 复核增量头条去重。
+- TG 推送全量 html.escape 转义(当前分支缺口)。
+- 契约同步: README/AGENTS.md/signals.json 字段兼容(旧信号无新增
+  字段走 setdefault 迁移)。
+
+### 步骤与验收标准
+1. [x] strategy.py 数据层迁移 OKX( candles 已收盘过滤/连续性校验/预热量,
+     ticker 报价新鲜度, funding 8h 周期, instruments 规格: tickSz/lotSz/
+     minSz/ctVal; 数量单位换算为张)。无 Binance 回退。
+   - 验收: `uv run --no-sync python -m unittest discover -s tests -p
+     'test_strategy_market.py' -v` 全过; mock 全 OKX 端点, 覆盖
+     未收盘 K 线不进指标、行情过期拒绝、费率缺失拒绝、张数/步长校验、
+     HTTP 失败无跨市场回退。
+2. [ ] 适配点位/成本/仓位到 OKX 合约语义( ctVal 换算、张数取整、
+     最小张数 minSz、费率方向与结算次数按 8h)。
+   - 验收: test_strategy_levels.py 全过(必要处适配张数断言); 净盈亏比
+     计算含 ctVal 与费率周期。
+3. [ ] tracker.py 移植 4 项改进 + 契约字段迁移( breakeven_after_tp1/
+     seen_headlines/last_ai_verdict setdefault; exit_reason 新枚举值)。
+   - 验收: 新增 tests/test_tracker.py: 触 TP1 后回撤保本结案记 0.5*TP1、
+     未 TP1 回撤仍记全额止损、开仓前插针不误判、旧档案字段迁移;
+     update_open_signals 现有行为不回归。
+4. [ ] crypto_radar.py 追踪层数据源换 OKX( get_market_data/
+     fetch_klines_since/ fetch_funding_rate 失败返回 None 并由预警层
+     豁免) + send_event_notice/html 全量转义 + AI 复核增量去重。
+   - 验收: tests/test_strategy_flow.py 全过(mock OKX 行情入口); 手工
+     构造含 `<script>` 的 detail 断言转义。
+5. [ ] 全量验证 + 独立只读复核 + 文档同步( README 数据源/点位/成本
+     章节改 OKX 口径; AGENTS.md 更新架构边界; PLAN 归档)。
+   - 验收: `uv run --no-sync python -m unittest discover -s tests -p
+     'test_strategy*.py' -v` 全过; 公开行情只读检查三币种给出策略或
+     明确拒绝原因(OKX 直连, 预期可真实拉到行情); plan-reviewer 复核
+     无缺口; `git diff --check` 无输出。
+
+### 已知约束
+- 环境: TG_BOT_TOKEN/TG_CHAT_ID/GEMINI_API_KEY 保持, 不新增环境变量;
+  不新增依赖; GitHub Actions 部署不改(仍每小时拉起, job 内循环不动)。
+- 兼容: data/signals.json 旧信号照常加载; 新增字段走 setdefault;
+  不修改已结案信号的历史记录。
+- `new/` 目录的 external 文件仅作参考, 不入库不入 git(加 .gitignore)。
+- 阈值与点位规则同前: 净 2R/3R、结构外止损、代码生成点位、AI 仅否决;
+  OKX 结算时间表(8h)按 fundingTime 实测推导, 不硬编码假设。
+- 教训沿用: 测试冻结 strategy.time.time; crypto_radar 模块级密钥 patch。

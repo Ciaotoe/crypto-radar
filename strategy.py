@@ -1,4 +1,4 @@
-"""Binance USDT perpetual pullback strategy; public data only, no order execution."""
+"""OKX USDT perpetual pullback strategy; public data only, no order execution."""
 import math
 import time
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
@@ -7,8 +7,8 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 
-FUTURES_API = "https://fapi.binance.com"
-MARKET = "Binance USDT 永续"
+OKX_API = "https://www.okx.com"
+MARKET = "OKX USDT 永续"
 HOUR_MS = 3_600_000
 MAX_QUOTE_AGE_MS = 120_000
 # These are conservative sizing assumptions, not the user's actual fee tier or
@@ -37,61 +37,84 @@ def positive(value, name):
     return value
 
 
+def okx_inst_id(symbol):
+    """'BTC/USDT' -> 'BTC-USDT-SWAP'"""
+    return f"{symbol.replace('/', '-')}-SWAP"
+
+
 def public_get(path, params=None):
-    response = requests.get(f"{FUTURES_API}{path}", params=params, timeout=15)
+    """OKX v5 统一 {"code": "0", "data": [...]}; 非 0 即业务错误, data 恒为列表。
+    单一 OKX 数据源, 失败不回退其他交易所(2026-10-21 与用户确认)。"""
+    response = requests.get(f"{OKX_API}{path}", params=params, timeout=15)
     response.raise_for_status()
     body = response.json()
-    if isinstance(body, dict) and "code" in body:
-        raise StrategyRejected(f"Binance 行情接口返回错误 {body['code']}")
-    return body
+    if not isinstance(body, dict) or body.get("code") != "0" \
+       or not isinstance(body.get("data"), list):
+        raise StrategyRejected(f"OKX 行情接口返回错误 {body.get('code', '格式异常')}")
+    return body["data"]
 
 
 def quote(symbol, now_ms=None):
-    pair = symbol.replace("/", "")
-    premium = public_get("/fapi/v1/premiumIndex", {"symbol": pair})
-    book = public_get("/fapi/v1/ticker/bookTicker", {"symbol": pair})
-    current = public_get("/fapi/v2/ticker/price", {"symbol": pair})
+    inst = okx_inst_id(symbol)
+    (ticker,) = public_get("/api/v5/market/ticker", {"instId": inst})
+    (mark,) = public_get("/api/v5/public/mark-price", {"instId": inst, "instType": "SWAP"})
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-    for item in (premium, book, current):
-        if item.get("symbol") != pair:
+    for item in (ticker, mark):
+        if item.get("instId") != inst:
             raise StrategyRejected("行情币种不一致")
-        timestamp = positive(item.get("time"), "行情时间")
+        timestamp = positive(item.get("ts"), "行情时间")
         if abs(now_ms - timestamp) > MAX_QUOTE_AGE_MS:
             raise StrategyRejected("永续行情过期或时钟偏差过大")
+    funding = public_get("/api/v5/public/funding-rate", {"instId": inst})[0]
     # Missing funding is unknown, never an invented zero.
     try:
-        funding = float(premium["lastFundingRate"])
+        rate = float(funding["fundingRate"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise StrategyRejected("Binance 资金费率缺失") from exc
-    if not math.isfinite(funding):
+        raise StrategyRejected("OKX 资金费率缺失") from exc
+    if not math.isfinite(rate):
         raise StrategyRejected("资金费率不是有限数")
-    bid, ask = positive(book.get("bidPrice"), "买一"), positive(book.get("askPrice"), "卖一")
+    bid, ask = positive(ticker.get("bidPx"), "买一"), positive(ticker.get("askPx"), "卖一")
     if ask < bid:
         raise StrategyRejected("买卖报价交叉")
-    next_funding = positive(premium.get("nextFundingTime"), "下次资金结算时间")
+    next_funding = positive(funding.get("nextFundingTime"), "下次资金结算时间")
     if next_funding <= now_ms:
         raise StrategyRejected("资金结算时间已过期")
-    return {"price": positive(current.get("price"), "永续最新价"),
+    return {"price": positive(ticker.get("last"), "永续最新价"),
             "bid": bid, "ask": ask,
-            "mark_price": positive(premium.get("markPrice"), "标记价"),
-            "funding_rate": funding, "next_funding_ms": next_funding,
+            "mark_price": positive(mark.get("markPx"), "标记价"),
+            "funding_rate": rate, "next_funding_ms": next_funding,
             "quoted_at_ms": now_ms}
 
 
 def closed_klines(symbol, interval, now_ms):
+    """OKX v5 candles 行: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]。
+    confirm=="1" 才是已收盘; 最新未收盘 bar 的 OHLC 仍在变化, 永不进信号。
+    OKX 单次上限 300 根, 4H EMA200 需 750 根预热, 用 after 游标分页向前翻。"""
     hours, count = (4, 800) if interval == "4h" else (1, 300)
-    rows = public_get("/fapi/v1/klines", {"symbol": symbol.replace("/", ""),
-                                       "interval": interval, "limit": count})
-    if not isinstance(rows, list) or not rows or any(len(row) < 7 for row in rows):
+    bar = {"4h": "4H", "1h": "1H", "15m": "15m"}[interval]
+    rows, after = [], ""
+    while len(rows) < count:
+        params = {"instId": okx_inst_id(symbol), "bar": bar,
+                  "limit": min(300, count - len(rows))}
+        if after:
+            params["after"] = after
+        batch = public_get("/api/v5/market/candles", params)
+        if not batch:
+            break
+        # 每页倒序(最新在前): 先翻成本页升序, 再接到已收集的更旧数据前
+        rows = batch[::-1] + rows
+        after = batch[-1][0]
+    if not rows:
         raise StrategyRejected("K 线格式不完整")
-    df = pd.DataFrame([row[:7] for row in rows], columns=[
-        "timestamp", "open", "high", "low", "close", "volume", "close_time"])
+    df = pd.DataFrame([row[:6] for row in rows], columns=[
+        "timestamp", "open", "high", "low", "close", "volume"])
+    # confirm 是第 9 列字符串 "1"/"0"; astype(float) 前先抽出
+    df["confirmed"] = [str(row[8]) == "1" for row in rows]
     try:
         df = df.astype(float)
     except (ValueError, TypeError) as exc:
         raise StrategyRejected("K 线含非数字") from exc
-    # Binance includes the current candle; never use its changing OHLC in signals.
-    df = df[df.close_time < now_ms].reset_index(drop=True)
+    df = df[df.confirmed == 1].reset_index(drop=True)
     minimum = 750 if interval == "4h" else 250
     if len(df) < minimum:
         raise StrategyRejected(f"{interval} 已收盘样本不足，指标尚未充分预热")
@@ -103,11 +126,12 @@ def closed_klines(symbol, interval, now_ms):
        or (df.low > df[["open", "close"]].min(axis=1)).any():
         raise StrategyRejected("K 线价格关系异常")
     duration = hours * HOUR_MS
-    if not (df.timestamp.diff().iloc[1:] == duration).all() \
-       or not (df.close_time == df.timestamp + duration - 1).all():
+    # OKX timestamp 是 K 线开始时间; 收盘 = 开始 + 周期
+    if not (df.timestamp.diff().iloc[1:] == duration).all():
         raise StrategyRejected("K 线重复、乱序或缺口")
-    if not 0 < now_ms - df.close_time.iloc[-1] <= duration:
+    if not 0 < now_ms - (df.timestamp.iloc[-1] + duration) <= duration:
         raise StrategyRejected(f"{interval} K 线过期")
+    df["close_time"] = df.timestamp + duration
     return df
 
 
@@ -122,37 +146,43 @@ def get_strategy_market_data(symbol):
     df1["ema20"] = ta.ema(df1.close, length=20, talib=False)
     df1["rsi"] = ta.rsi(df1.close, length=14, talib=False)
     df1["atr"] = ta.atr(df1.high, df1.low, df1.close, length=14, talib=False)
-    exchange = public_get("/fapi/v1/exchangeInfo")
-    instrument = next((x for x in exchange.get("symbols", [])
-                       if x.get("symbol") == symbol.replace("/", "")), None)
-    if not instrument or instrument.get("status") != "TRADING" \
-       or instrument.get("contractType") != "PERPETUAL" \
-       or instrument.get("quoteAsset") != "USDT" or instrument.get("marginAsset") != "USDT":
+    specs = public_get("/api/v5/public/instruments", {"instType": "SWAP",
+                                                      "instId": okx_inst_id(symbol)})
+    if not specs:
         raise StrategyRejected("品种不是正在交易的 USDT 永续")
-    filters = {x["filterType"]: x for x in instrument["filters"]}
-    funding_info = public_get("/fapi/v1/fundingInfo")
-    if not isinstance(funding_info, list):
-        raise StrategyRejected("资金结算周期数据不完整")
-    # fundingInfo lists contracts with adjustments; unlisted contracts use 8h.
-    adjusted = next((x for x in funding_info if x.get("symbol") == instrument["symbol"]), None)
-    interval = positive(adjusted.get("fundingIntervalHours") if adjusted else 8, "资金周期")
+    inst = specs[0]
+    # linear U 本位: ctType=linear 且以 USDT 结算; state=live 才可交易
+    if inst.get("state") != "live" or inst.get("ctType") != "linear" \
+       or inst.get("settleCcy") != "USDT":
+        raise StrategyRejected("品种不是正在交易的 USDT 永续")
     q = quote(symbol)
-    if interval > 8 or q["next_funding_ms"] - q["quoted_at_ms"] > interval * HOUR_MS:
+    # 结算周期按接口实测推导: nextFundingTime - prevFundingTime。
+    # OKX 部分币种费率异常时 4h 结算, 写死 8h 会系统性低估持仓成本。
+    funding = public_get("/api/v5/public/funding-rate", {"instId": okx_inst_id(symbol)})[0]
+    interval_ms = positive(funding.get("nextFundingTime"), "下次结算") \
+        - positive(funding.get("prevFundingTime"), "上次结算")
+    interval_hours = interval_ms / HOUR_MS
+    if interval_hours <= 0 or interval_hours > 8 \
+       or q["next_funding_ms"] - q["quoted_at_ms"] > interval_ms:
         raise StrategyRejected("资金结算周期与下次结算时间不一致")
     c4, c1 = df4.iloc[-1], df1.iloc[-1]
-    data = {"symbol": symbol, "market": MARKET, **q,
+    # OKX 合约是张数模式: qty 单位是"张", 1 张 = ctVal 个币(BTC 1张=0.01 BTC)。
+    # 最小名义金额无直接字段, 按 最小张数*面值*现价 推导。
+    ctval = positive(inst.get("ctVal"), "合约面值")
+    data = {"symbol": symbol, "market": MARKET, "ct_val": ctval, **q,
             "4h_ema20": float(c4.ema20), "4h_ema50": float(c4.ema50),
             "4h_ema200": float(c4.ema200), "4h_ema20_prev": float(df4.ema20.iloc[-4]),
             "4h_adx": float(c4.adx), "4h_di_plus": float(c4.di_plus),
             "4h_di_minus": float(c4.di_minus), "4h_close": float(c4.close),
             "1h_rsi": float(c1.rsi), "1h_atr": float(c1.atr),
             "1h_ema20": float(c1.ema20), "bars_1h": df1, "bars_4h": df4,
-            "signal_close_ms": int(c1.close_time), "funding_interval_hours": interval,
-            "tick_size": positive(filters.get("PRICE_FILTER", {}).get("tickSize"), "价格步长"),
-            "qty_step": positive(filters.get("MARKET_LOT_SIZE", {}).get("stepSize"), "数量步长"),
-            "min_qty": positive(filters.get("MARKET_LOT_SIZE", {}).get("minQty"), "最小数量"),
-            "max_qty": positive(filters.get("MARKET_LOT_SIZE", {}).get("maxQty"), "最大数量"),
-            "min_notional": positive(filters.get("MIN_NOTIONAL", {}).get("notional"), "最小名义金额")}
+            "signal_close_ms": int(c1.close_time),
+            "funding_interval_hours": interval_hours,
+            "tick_size": positive(inst.get("tickSz"), "价格步长"),
+            "qty_step": positive(inst.get("lotSz"), "数量步长"),
+            "min_qty": positive(inst.get("minSz"), "最小数量"),
+            "max_qty": positive(inst.get("maxMktSz"), "最大下单量"),
+            "min_notional": positive(inst.get("minSz"), "最小张数") * ctval * q["price"]}
     if not all(math.isfinite(data[k]) for k in ["4h_ema20", "4h_ema50", "4h_ema200",
                     "4h_ema20_prev", "4h_adx", "4h_di_plus", "4h_di_minus", "1h_rsi", "1h_atr", "1h_ema20"]):
         raise StrategyRejected("指标不完整")
@@ -163,7 +193,7 @@ def signal_direction(data, now_ms=None):
     """Require a completed retest and reversal, rather than mere EMA proximity."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     if data.get("market") != MARKET:
-        raise StrategyRejected("策略需要 Binance USDT 永续行情")
+        raise StrategyRejected("策略需要 OKX USDT 永续行情")
     if not 0 <= now_ms - positive(data.get("quoted_at_ms"), "报价时间") <= MAX_QUOTE_AGE_MS:
         raise StrategyRejected("策略报价已过期")
     if not 0 < now_ms - positive(data.get("signal_close_ms"), "确认时间") <= 45 * 60_000:
@@ -301,7 +331,7 @@ def validate_plan(plan, data):
     if values["structure_boundary"] != actual_boundary:
         raise StrategyRejected("目标结构与行情证据不一致")
     if any(abs(x - round_tick(x, data["tick_size"])) > 1e-8 for x in [values["stop"], values["tp1"], values["tp2"], low, high]):
-        raise StrategyRejected("点位不符合 Binance 价格步长")
+        raise StrategyRejected("点位不符合 OKX 价格步长")
     return {"loss_per_unit": loss, "net_rr": reward / loss,
             "estimated_cost_per_unit": cost_per_unit(data, worst, values["stop"], side)}
 
