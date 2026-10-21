@@ -151,7 +151,7 @@
      最小张数 minSz、费率方向与结算次数按 8h)。
    - 验收: test_strategy_levels.py 全过(必要处适配张数断言); 净盈亏比
      计算含 ctVal 与费率周期。
-3. [ ] tracker.py 移植 4 项改进 + 契约字段迁移( breakeven_after_tp1/
+3. [x] tracker.py 移植 4 项改进 + 契约字段迁移( breakeven_after_tp1/
      seen_headlines/last_ai_verdict setdefault; exit_reason 新枚举值)。
    - 验收: 新增 tests/test_tracker.py: 触 TP1 后回撤保本结案记 0.5*TP1、
      未 TP1 回撤仍记全额止损、开仓前插针不误判、旧档案字段迁移;

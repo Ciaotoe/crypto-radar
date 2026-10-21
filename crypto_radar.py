@@ -288,10 +288,12 @@ def send_event_notice(events):
         for e in exits:
             s = e['sig']
             reason = {
-                'stopped_out': "触及止损离场", 'took_profit': "止盈离场",
+                'stopped_out': "触及止损离场",
+                'breakeven_after_tp1': "TP1减仓后回撤保本离场",
+                'took_profit': "止盈离场",
                 'trend_reversed': "趋势翻转离场", 'timeout': "追踪满48h关闭",
                 'manual_reset': "人工清仓重置",
-            }[e['reason']]
+            }.get(e['reason'], e['reason'])
             mech = "" if s.get('strategy') else "（无点位存档, 机械口径）"
             lines.append(
                 f"{s['symbol']} {'做空' if s['direction'] == 'short' else '做多'}"
