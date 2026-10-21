@@ -17,7 +17,9 @@
       "strategy": null,
       "tp1_hit": false,
       "alerts_fired": [],
-      "last_ai_review": null
+      "last_ai_review": null,
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "ETH/USDT-short-2026-10-18",
@@ -38,7 +40,9 @@
       "alerts_fired": [
         "drawdown"
       ],
-      "last_ai_review": null
+      "last_ai_review": null,
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "SOL/USDT-short-2026-10-18",
@@ -59,7 +63,9 @@
       "alerts_fired": [
         "drawdown"
       ],
-      "last_ai_review": null
+      "last_ai_review": null,
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "BTC/USDT-short-2026-10-19",
@@ -78,7 +84,9 @@
       "strategy": null,
       "tp1_hit": false,
       "alerts_fired": [],
-      "last_ai_review": null
+      "last_ai_review": null,
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "ETH/USDT-short-2026-10-19",
@@ -97,7 +105,9 @@
       "exit_reason": "manual_reset",
       "tp1_hit": false,
       "alerts_fired": [],
-      "last_ai_review": null
+      "last_ai_review": null,
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "SOL/USDT-short-2026-10-19",
@@ -116,7 +126,9 @@
       "exit_reason": "manual_reset",
       "tp1_hit": false,
       "alerts_fired": [],
-      "last_ai_review": null
+      "last_ai_review": null,
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "SOL/USDT-short-2026-10-19T12:05",
@@ -140,7 +152,9 @@
         "drawdown",
         "ai_review"
       ],
-      "last_ai_review": "2026-10-20T17:14:50.516483+08:00"
+      "last_ai_review": "2026-10-20T17:14:50.516483+08:00",
+      "seen_headlines": [],
+      "last_ai_verdict": null
     },
     {
       "id": "ETH/USDT-short-2026-10-20T23:26",
@@ -159,7 +173,9 @@
       "tp1_hit": false,
       "last_price": 2462.6,
       "alerts_fired": [],
-      "last_ai_review": "2026-10-21T02:59:51.501511+08:00"
+      "last_ai_review": "2026-10-21T02:59:51.501511+08:00",
+      "seen_headlines": [],
+      "last_ai_verdict": null
     }
   ]
 }
