@@ -14,24 +14,29 @@
       "triggered_at": "2026-10-19T07:41:01+08:00",
       "last_checked_at": "2026-10-19T08:25:00+08:00",
       "status": "active",                     # active / exited
-      "exit_reason": null,                    # exited 时: stopped_out / took_profit
+      "exit_reason": null,                    # exited 时: stopped_out /
+                                            #   breakeven_after_tp1 / took_profit
                                             #   / trend_reversed / timeout
       "pnl_now": 0.12,                        # 当前(或结案时)浮盈 % (有利为正)
       "mfe": 1.2,                             # 期间最大有利波动 %
       "mae": -0.5,                            # 期间最大不利波动 %
-      "tp1_hit": false,                       # 仅记档, 不推送不结案
+      "tp1_hit": false,                       # 命中后止损上移至入场价(保本)
       "last_price": 81790.0,
-      "alerts_fired": []                      # 已推过的预警类型(防重复刷屏)
+      "alerts_fired": [],                     # 已推过的预警类型(防重复刷屏)
+      "seen_headlines": [],                   # AI 复核已审阅的新闻头条(增量去重)
+      "last_ai_verdict": null                 # 上次 AI 复核结论(同结论不重复推)
     }
   ]
 }
 
-推送口径(2026-10-19 与用户确认):
+推送口径(2026-10-19 与用户确认; 2026-10-21 迁移 OKX 时移植保本闭环):
 - 价格触及预设点位(止损/止盈)是交易所自动执行的旧闻, 只结案+简短通知, 不预警;
 - 唯一紧急事件: 4H 排列翻转但止损尚未被触及 —— 需要人立刻决策离场;
 - 预警(不结案): 浮盈大幅回吐 / ADX 动能消散, 同信号同原因只推一次;
 - 所有触及判定用 15m K 线扫描上次检查以来的区间, 插针不漏(20 分钟粒度巡检
-  本身不实时, 扫描窗口让"衡量口径"尽量准)。
+  本身不实时, 扫描窗口让"衡量口径"尽量准);
+- TP1 命中后有效止损上移至入场价: 回撤打保本按 半仓TP1+半仓保本 结案
+  (breakeven_after_tp1), 与真实分批止盈的期望收益一致。
 """
 import json
 import os
@@ -42,6 +47,7 @@ BJ_TZ = timezone(timedelta(hours=8))  # 统一用北京时间, 与用户感知�
 TRACK_HOURS = 48  # 信号追踪时长, 超时机械关闭
 TIMEOUT = 'timeout'
 STOPPED_OUT = 'stopped_out'
+BREAKEVEN_AFTER_TP1 = 'breakeven_after_tp1'
 TOOK_PROFIT = 'took_profit'
 TREND_REVERSED = 'trend_reversed'
 # 预警类型与默认阈值(环境变量可覆盖; 值是初版经验值, 按长期统计调整后可收紧)
@@ -82,6 +88,8 @@ def load_signals():
         sig.setdefault('tp1_hit', False)
         sig.setdefault('alerts_fired', [])
         sig.setdefault('last_ai_review', None)  # AI 消息面复核节流(2026-10-19)
+        sig.setdefault('seen_headlines', [])    # 复核增量头条去重(2026-10-21)
+        sig.setdefault('last_ai_verdict', None)  # 同结论不重复推(2026-10-21)
     return store
 
 
@@ -130,6 +138,9 @@ def record_new_signal(store, data, signal_type, strategy=None):
         "tp1_hit": False,
         "last_price": data['price'],
         "alerts_fired": [],
+        "last_ai_review": None,
+        "seen_headlines": [],
+        "last_ai_verdict": None,
     }
 
 
@@ -142,22 +153,26 @@ def _pnl_pct(direction, entry, price):
 
 
 def _trend_ok(direction, d):
-    """4H EMA20/50 排列方向与信号方向是否仍一致"""
+    """仅以 4H EMA20/50 排列是否维持判趋势存续(2026-10-21 移植:
+    盘中实时价刺破 EMA50 属正常洗盘, 交由硬止损防守, 不再误判翻转)。
+    d 的 4h_ema20/50 由调用方保证来自已收盘 K 线。"""
     if direction == 'short':
-        return d['price'] < d['4h_ema50'] and d['4h_ema20'] < d['4h_ema50']
-    return d['price'] > d['4h_ema50'] and d['4h_ema20'] > d['4h_ema50']
+        return d['4h_ema20'] < d['4h_ema50']
+    return d['4h_ema20'] > d['4h_ema50']
 
 
-def _check_exit(strategy, direction, hi, lo):
+def _check_exit(strategy, direction, hi, lo, entry_price=None, tp1_already_hit=False):
     """用扫描窗口高低点判定策略离场。同一窗口止损与止盈双触时保守按
-    止损先触发(bar 内先后不可知)。返回 exit_reason 或 None"""
+    止损先触发(bar 内先后不可知)。TP1 已命中后有效止损上移至入场价
+    (保本止损)。返回 exit_reason 或 None"""
     if not strategy:
         return None
     stop, tp2 = strategy.get('stop'), strategy.get('tp2')
-    hit_stop = stop is not None and (hi >= stop if direction == 'short' else lo <= stop)
+    eff_stop = entry_price if (tp1_already_hit and entry_price is not None) else stop
+    hit_stop = eff_stop is not None and (hi >= eff_stop if direction == 'short' else lo <= eff_stop)
     hit_tp2 = tp2 is not None and (lo <= tp2 if direction == 'short' else hi >= tp2)
     if hit_stop:
-        return STOPPED_OUT
+        return BREAKEVEN_AFTER_TP1 if tp1_already_hit else STOPPED_OUT
     if hit_tp2:
         return TOOK_PROFIT
     return None
@@ -201,15 +216,20 @@ def _check_alerts(sig, d, now):
 
 def _scan_window(sig, fetch_klines, d):
     """15m K 线扫描上次检查以来的窗口, 覆盖巡检间隔内的插针。
+    窗口起点不早于开仓时刻(2026-10-21 移植): 旧信号 last_checked_at 可能
+    因历史原因早于 triggered_at, 开仓前的插针不属于本信号。
     扫描失败退化为现价(hi=lo=现价), 行为不劣于旧口径。"""
     hi, lo = d['price'], d['price']
     if fetch_klines is None:
         return hi, lo
     try:
-        start_ms = int(_parse_dt(sig['last_checked_at']).timestamp() * 1000)
+        last_ms = int(_parse_dt(sig['last_checked_at']).timestamp() * 1000)
+        trig_ms = int(_parse_dt(sig['triggered_at']).timestamp() * 1000)
+        start_ms = max(last_ms, trig_ms)
         df15 = fetch_klines(sig['symbol'], '15m', start_ms)
-        hi = max(hi, float(df15['high'].max()))
-        lo = min(lo, float(df15['low'].min()))
+        if df15 is not None and not df15.empty:
+            hi = max(hi, float(df15['high'].max()))
+            lo = min(lo, float(df15['low'].min()))
     except Exception:
         pass
     return hi, lo
@@ -255,13 +275,27 @@ def update_open_signals(store, get_market_data, fetch_klines=None):
         sig['last_checked_at'] = now.isoformat()
         changed = True
 
-        # 1) 策略点位离场(止损被扫到 => 事已发生, 无需紧急预警)
-        exit_reason = _check_exit(sig['strategy'], sig['direction'], hi, lo)
+        # 1) 策略点位离场(止损被扫到 => 事已发生, 无需紧急预警)。
+        #    TP1 已命中后止损上移保本, 回撤打保本按半仓TP1+半仓保本结算
+        exit_reason = _check_exit(sig['strategy'], sig['direction'], hi, lo,
+                                  entry_price=sig['entry_price'],
+                                  tp1_already_hit=bool(sig.get('tp1_hit')))
         if exit_reason:
             # 结案浮盈按触及价位算, 不用巡检现价(衡量口径)
-            mark = {STOPPED_OUT: 'stop', TOOK_PROFIT: 'tp2'}[exit_reason]
-            sig['pnl_now'] = _pnl_pct(sig['direction'], sig['entry_price'],
-                                      sig['strategy'][mark])
+            if exit_reason == STOPPED_OUT:
+                sig['pnl_now'] = _pnl_pct(sig['direction'], sig['entry_price'],
+                                          sig['strategy']['stop'])
+            elif exit_reason == TOOK_PROFIT:
+                # 半仓 TP1 止盈 + 半仓 TP2 止盈的综合(分批止盈的期望口径)
+                tp1_pnl = _pnl_pct(sig['direction'], sig['entry_price'],
+                                   sig['strategy']['tp1'])
+                tp2_pnl = _pnl_pct(sig['direction'], sig['entry_price'],
+                                   sig['strategy']['tp2'])
+                sig['pnl_now'] = round(0.5 * tp1_pnl + 0.5 * tp2_pnl, 3)
+            else:  # BREAKEVEN_AFTER_TP1: 半仓 TP1 止盈 + 半仓入场价保本
+                tp1_pnl = _pnl_pct(sig['direction'], sig['entry_price'],
+                                   sig['strategy']['tp1'])
+                sig['pnl_now'] = round(0.5 * tp1_pnl, 3)
             sig['status'] = 'exited'
             sig['exit_reason'] = exit_reason
             changed = True

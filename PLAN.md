@@ -83,11 +83,11 @@
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_market.py' -v`；全部通过，覆盖未收盘 K 线不改变趋势指标、现价独立更新、行情缺失/过期拒绝发策略、费率缺失不当作零费率、EMA200 预热充足，以及所选交易市场的数据一致性。
 2. [x] 完善趋势方向、回踩/反弹确认与追价限制。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_signal.py' -v`；全部通过，覆盖多空确认、下跌未止/上涨未止拒绝、未触及支撑/阻力拒绝、偏离按 ATR 归一化、超时或价格跑远拒绝。
-3. [ ] 完善点位、交易成本、结构空间和仓位风险约束。
+3. [x] 完善点位、交易成本、结构空间和仓位风险约束。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_levels.py' -v`；全部通过，覆盖正数/有限数/方向校验、数字入场与建议一致、净 TP1 盈亏比至少 2:1、止损在结构外且不过宽/过窄、目标不越过已知反向结构、交易成本和账户风险上限计算正确、不合格 AI 输出拒绝推送。
-4. [ ] 接入候选择优、推送前复核并更新策略说明。
+4. [x] 接入候选择优、推送前复核并更新策略说明。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy_flow.py' -v`；全部通过，覆盖不同币价候选使用可比较指标、首选失败不阻断其余合格候选、推送前失效拒绝、无有效策略不推送/不建新档案；`git diff --check` 无输出。
-5. [ ] 完整验证与独立只读复核，记录实际限制并归档本轮计划。
+5. [x] 完整验证与独立只读复核，记录实际限制并归档本轮计划。
    - 验收：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy*.py' -v` 全部通过；公开行情只读检查能给出策略或明确拒绝原因，不调用 Telegram/实际订单接口、不改信号档案；按本轮计划逐项只读复核无遗漏。保存验证记录与必要项目规则后，每个完成步骤单独提交，不推送。
 
 ### 已知约束
@@ -99,3 +99,99 @@
 - 保留上方已有追踪计划；本轮完成时归档仅处理新增策略计划，不删除或改名已有文件。
 - 步骤1：新策略使用独立永续数据入口，保留旧追踪接口与档案结构。Binance 永续 HTTP 451，公开行情验证以明确拒绝原因为验收，不使用跨市场替代。API 官方连接器说明可读，官方网页抓取失败。
 - 步骤2：EMA200、DI 与斜率用于方向一致性；1H 收盘反转及均线触及才构成候选，45 分钟有效、ATR 限制追价。所有阈值仅为待验证规则，不表述“确定性机会”。
+
+## 完成记录(策略完善轮, 2026-10-20 归档)
+
+- 步骤1-2 前期完成(提交 d043b39/2c1e4f7); 步骤3 提交 8d2c2e6(9 测试), 步骤4 提交
+  8b9186d(8 测试); 步骤5 收尾: 全量 31/31 通过, `git diff --check` 无输出。
+- 公开行情只读检查(本机 451): BTC/ETH/SOL 均输出明确拒绝 `HTTP 451`, 未调
+  TG/订单接口、未改档案 —— 按计划约束以此口径验收, 不用跨市场替代。
+- 独立只读复核(plan-reviewer): 判定 PASS —— 步骤1-4 验收逐项达成, 约束零违反
+  (追踪层/部署/依赖/环境变量/敏感文件均无 diff), 无 stub; data/signals.json
+  的字段变化为巡检自然产物。
+- 关键决策: AI 职责收敛为"只可否决"(用户已确认点位由代码生成); 推送文案与
+  档案点位同源于一份规则计划, 不再存在模型文本与存档两个口径; 候选择优按
+  ATR 归一贴近度(绝对差跨币价不可比, 旧口径会让高价币永远输)。
+- 教训: 测 `run_scan` 需冻结 `strategy.time.time`(真实时钟使 fixture 行情全部
+  "报价过期"), 并 patch `crypto_radar` 模块级密钥属性; 已沉淀到项目 AGENTS.md。
+- 归档: 本轮计划完成, 保留上方追踪计划不动; 项目 AGENTS.md 已建, 记录架构
+  边界、451 约束与测试要点。不推送, 由用户决定合并。
+
+## 第三轮: 迁移 OKX + 移植追踪改进(2026-10-21, 已完成)
+
+### 背景
+- 用户确认: 整个系统(行情源与实际交易市场)迁移到 OKX USDT 永续;
+  并采纳 external `new/` 版中 4 项追踪层真改进, 但**不采纳**其
+  crypto_radar 架构(回退 AI 生成点位/放弃成本校验等, 已评审为倒退)。
+- 用户确认(2026-10-21): 单一 OKX 数据源, 不做失败回退。
+- 本机实测 OKX v5 公开接口全部可用: candles/ticker/mark-price/
+  funding-rate/funding-rate-history/instruments, 无 451 限制。
+- 关键差异: OKX 合约为 ctVal 张数模式(BTC 1张=0.01 BTC), 数量单位
+  与 Binance 币本位不同; 费率每 8h 结算(ticker 实测 28800000ms 间隔)。
+
+### 目标
+- strategy.py 数据层整体换为 OKX v5, 单一行情源无回退(回退会重新引入
+  跨市场基差错位); 策略规则/点位生成/成本校验逻辑不变, 仅适配数据。
+- tracker.py 移植 4 项改进: TP1 后保本闭环(breakeven_after_tp1)、
+  _trend_ok 仅看已收盘 EMA20/50 排列、扫描窗口防开仓前插针、
+  AI 复核增量头条去重。
+- TG 推送全量 html.escape 转义(当前分支缺口)。
+- 契约同步: README/AGENTS.md/signals.json 字段兼容(旧信号无新增
+  字段走 setdefault 迁移)。
+
+### 步骤与验收标准
+1. [x] strategy.py 数据层迁移 OKX( candles 已收盘过滤/连续性校验/预热量,
+     ticker 报价新鲜度, funding 8h 周期, instruments 规格: tickSz/lotSz/
+     minSz/ctVal; 数量单位换算为张)。无 Binance 回退。
+   - 验收: `uv run --no-sync python -m unittest discover -s tests -p
+     'test_strategy_market.py' -v` 全过; mock 全 OKX 端点, 覆盖
+     未收盘 K 线不进指标、行情过期拒绝、费率缺失拒绝、张数/步长校验、
+     HTTP 失败无跨市场回退。
+2. [x] 适配点位/成本/仓位到 OKX 合约语义( ctVal 换算、张数取整、
+     最小张数 minSz、费率方向与结算次数按 8h)。
+   - 验收: test_strategy_levels.py 全过(必要处适配张数断言); 净盈亏比
+     计算含 ctVal 与费率周期。
+3. [x] tracker.py 移植 4 项改进 + 契约字段迁移( breakeven_after_tp1/
+     seen_headlines/last_ai_verdict setdefault; exit_reason 新枚举值)。
+   - 验收: 新增 tests/test_tracker.py: 触 TP1 后回撤保本结案记 0.5*TP1、
+     未 TP1 回撤仍记全额止损、开仓前插针不误判、旧档案字段迁移;
+     update_open_signals 现有行为不回归。
+4. [x] crypto_radar.py 追踪层数据源换 OKX( get_market_data/
+     fetch_klines_since/ fetch_funding_rate 失败返回 None 并由预警层
+     豁免) + send_event_notice/html 全量转义 + AI 复核增量去重。
+   - 验收: tests/test_strategy_flow.py 全过(mock OKX 行情入口); 手工
+     构造含 `<script>` 的 detail 断言转义。
+5. [x] 全量验证 + 独立只读复核 + 文档同步( README 数据源/点位/成本
+     章节改 OKX 口径; AGENTS.md 更新架构边界; PLAN 归档)。
+   - 验收: `uv run --no-sync python -m unittest discover -s tests -p
+     'test_strategy*.py' -v` 全过; 公开行情只读检查三币种给出策略或
+     明确拒绝原因(OKX 直连, 预期可真实拉到行情); plan-reviewer 复核
+     无缺口; `git diff --check` 无输出。
+
+### 已知约束
+- 环境: TG_BOT_TOKEN/TG_CHAT_ID/GEMINI_API_KEY 保持, 不新增环境变量;
+  不新增依赖; GitHub Actions 部署不改(仍每小时拉起, job 内循环不动)。
+- 兼容: data/signals.json 旧信号照常加载; 新增字段走 setdefault;
+  不修改已结案信号的历史记录。
+- `new/` 目录的 external 文件仅作参考, 不入库不入 git(加 .gitignore)。
+- 阈值与点位规则同前: 净 2R/3R、结构外止损、代码生成点位、AI 仅否决;
+  OKX 结算时间表(8h)按 fundingTime 实测推导, 不硬编码假设。
+- 教训沿用: 测试冻结 strategy.time.time; crypto_radar 模块级密钥 patch。
+
+### 完成记录(第三轮, 2026-10-21)
+- 提交: e9ecbb9(步骤1 数据层) / fac3bf5(步骤2 张数) / 1e69d43(步骤3 追踪
+  改进) / 84adadd(步骤4 追踪层OKX+转义+去重) / 997c29f(费率cap修复+文档) /
+  2ed55b6(new/ 忽略)。测试 45/45 通过(新增 market 1 项、levels 1 项、
+  tracker 7 项、flow 2 项), `git diff --check` 无输出。
+- 公开行情只读检查(OKX 直连): BTC "4H ADX 低于趋势筛选阈值"、ETH/SOL
+  "4H 均线、斜率或方向指标不一致" —— 均给出明确拒绝原因, 未调 TG/档案。
+- 独立只读复核(plan-reviewer): PASS —— 分页拼接用真实 OKX 数据独立验证
+  (799 根 4H 无重复无缺口), 张数换算/保本结算数学/转义覆盖/约束逐项确认。
+- 端到端真 bug 修复: OKX 费率极低时跳过结算(BTC 实测 next-prev=16h),
+  原校验把 16h 当常规周期会低估成本; 改为 min(观测, 8h) 保守预算,
+  观测 >16h(连跳两次)才拒绝。
+- 遗留标注(复核员, 不影响正确性): 追踪层 4H EMA200 用 250 根预热有偏差,
+  但该值仅存档展示不参与判定; seen_headlines [-20:] 基于 set 序非严格
+  "最近20条", verdict 去重兜底。
+- 不推送, 由用户决定合并; Actions 部署未动(下一小时巡检将自动切换
+  OKX 数据源)。
