@@ -126,18 +126,40 @@
       "entry_price": 105.16,
       "strategy": null,
       "triggered_at": "2026-10-19T12:05:41.207740+08:00",
-      "last_checked_at": "2026-10-19T19:06:26.109421+08:00",
-      "status": "active",
-      "exit_reason": null,
-      "pnl_now": 0.456,
-      "mfe": 0.694,
-      "mae": -1.008,
+      "last_checked_at": "2026-10-20T22:46:23.856782+08:00",
+      "status": "exited",
+      "exit_reason": "trend_reversed",
+      "pnl_now": -1.987,
+      "mfe": 1.541,
+      "mae": -2.938,
       "tp1_hit": false,
-      "last_price": 104.68,
+      "last_price": 107.25,
       "alerts_fired": [
+        "ai_review",
+        "ai_review",
+        "drawdown",
         "ai_review"
       ],
-      "last_ai_review": null
+      "last_ai_review": "2026-10-20T17:14:50.516483+08:00"
+    },
+    {
+      "id": "ETH/USDT-short-2026-10-20T23:26",
+      "symbol": "ETH/USDT",
+      "direction": "short",
+      "signal_type": "顺势做空 (4H下跌趋势确立 + 1H反弹触及关键均线阻力)",
+      "entry_price": 2430.6,
+      "strategy": null,
+      "triggered_at": "2026-10-20T23:26:45.082477+08:00",
+      "last_checked_at": "2026-10-21T06:11:58.880799+08:00",
+      "status": "exited",
+      "exit_reason": "trend_reversed",
+      "pnl_now": -1.317,
+      "mfe": 0.149,
+      "mae": -1.378,
+      "tp1_hit": false,
+      "last_price": 2462.6,
+      "alerts_fired": [],
+      "last_ai_review": "2026-10-21T02:59:51.501511+08:00"
     }
   ]
 }
