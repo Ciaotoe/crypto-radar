@@ -161,7 +161,7 @@
      豁免) + send_event_notice/html 全量转义 + AI 复核增量去重。
    - 验收: tests/test_strategy_flow.py 全过(mock OKX 行情入口); 手工
      构造含 `<script>` 的 detail 断言转义。
-5. [ ] 全量验证 + 独立只读复核 + 文档同步( README 数据源/点位/成本
+5. [x] 全量验证 + 独立只读复核 + 文档同步( README 数据源/点位/成本
      章节改 OKX 口径; AGENTS.md 更新架构边界; PLAN 归档)。
    - 验收: `uv run --no-sync python -m unittest discover -s tests -p
      'test_strategy*.py' -v` 全过; 公开行情只读检查三币种给出策略或

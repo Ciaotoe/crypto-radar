@@ -158,10 +158,22 @@ class MarketTests(unittest.TestCase):
         def altered(path, params=None):
             body = copy.deepcopy(api(path, params))
             if path.endswith("funding-rate"):
-                body[0]["nextFundingTime"] = str(NOW + 9 * s.HOUR_MS)
+                # prev=NOW-3h, next=NOW+18h -> 观测间隔 21h, 连跳两次以上, 拒绝
+                body[0]["prevFundingTime"] = str(NOW - 3 * s.HOUR_MS)
+                body[0]["nextFundingTime"] = str(NOW + 18 * s.HOUR_MS)
             return body
         with self.assertRaisesRegex(s.StrategyRejected, "结算周期"):
             self.market(altered)
+
+    def test_skipped_settlement_observed_interval_capped_to_8h(self):
+        # OKX 费率极低时跳过一次结算, 观测间隔 16h: 周期按 8h 保守预算, 不拒绝
+        def altered(path, params=None):
+            body = copy.deepcopy(api(path, params))
+            if path.endswith("funding-rate"):
+                body[0]["prevFundingTime"] = str(NOW - 15 * s.HOUR_MS)
+            return body
+        data = self.market(altered)
+        self.assertEqual(data["funding_interval_hours"], 8)
 
     def test_contract_specs_in_data(self):
         data = self.market()

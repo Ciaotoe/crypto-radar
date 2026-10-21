@@ -156,14 +156,16 @@ def get_strategy_market_data(symbol):
        or inst.get("settleCcy") != "USDT":
         raise StrategyRejected("品种不是正在交易的 USDT 永续")
     q = quote(symbol)
-    # 结算周期按接口实测推导: nextFundingTime - prevFundingTime。
-    # OKX 部分币种费率异常时 4h 结算, 写死 8h 会系统性低估持仓成本。
+    # 结算周期按接口推导, 但防"跳过结算"特例: OKX 费率极低时会跳过某次结算,
+    # 实测 BTC next-prev 可达 16h(2026-10-21 端到端验证发现)。若把 16h 当
+    # 常规周期会低估结算次数和成本; 取观测值与 8h(OKX 常规上限)的较小者,
+    # 宁可多预算一次结算(成本上界是保守方向)。
     funding = public_get("/api/v5/public/funding-rate", {"instId": okx_inst_id(symbol)})[0]
     interval_ms = positive(funding.get("nextFundingTime"), "下次结算") \
         - positive(funding.get("prevFundingTime"), "上次结算")
-    interval_hours = interval_ms / HOUR_MS
-    if interval_hours <= 0 or interval_hours > 8 \
-       or q["next_funding_ms"] - q["quoted_at_ms"] > interval_ms:
+    interval_hours = min(interval_ms / HOUR_MS, 8)
+    # 观测间隔 > 16h = 连跳两次以上, 属数据异常而非常规跳过
+    if interval_hours <= 0 or interval_ms > 16 * HOUR_MS:
         raise StrategyRejected("资金结算周期与下次结算时间不一致")
     c4, c1 = df4.iloc[-1], df1.iloc[-1]
     # OKX 合约是张数模式: qty 单位是"张", 1 张 = ctVal 个币(BTC 1张=0.01 BTC)。
