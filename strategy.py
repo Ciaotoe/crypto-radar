@@ -285,16 +285,24 @@ def cost_per_unit(data, entry, exit_price, direction, hours=HOLD_HOURS):
 
 
 def risk_size(plan, equity):
+    """OKX 张数语义: qty 单位是"张", 1 张 = ctVal 个币(lotSz 即每张面值,
+    minSz 是最小张数)。风险/名义先按币数量算, 再除以 ctVal 得张数并按
+    整数张向下取整; 损失/名义换回币单位输出。凑不足最小张数即放弃。"""
     equity = positive(equity, "账户权益")
     loss = positive(plan.get("loss_per_unit"), "每单位预计止损损失")
     entry = positive(plan.get("entry_max"), "入场上界")
-    qty = min(equity * ACCOUNT_RISK / loss, equity * MAX_NOTIONAL_EQUITY / entry,
-              positive(plan.get("max_qty"), "最大下单量"))
-    qty = round_tick(qty, positive(plan.get("qty_step"), "数量步长"))
-    if qty < plan["min_qty"] or qty * plan["entry_min"] < plan["min_notional"]:
+    ct_val = positive(plan.get("ct_val"), "合约面值")
+    base_qty = min(equity * ACCOUNT_RISK / loss, equity * MAX_NOTIONAL_EQUITY / entry,
+                   positive(plan.get("max_qty"), "最大下单量") * ct_val)
+    lots = round_tick(base_qty / ct_val, 1)  # 张数取整数张, lotSz 是面值不是步长
+    base_lots = lots * ct_val  # 取整后的实际币数量
+    if lots < positive(plan.get("min_qty"), "最小张数") \
+       or base_lots * plan["entry_min"] < plan["min_notional"]:
         raise StrategyRejected("账户权益对应的风险额度不足最小下单要求；不可加仓凑单")
-    return {"qty": qty, "estimated_loss": qty * loss,
-            "notional_max": qty * entry, "account_risk_pct": qty * loss / equity * 100}
+    return {"qty": lots, "base_qty": base_lots,
+            "estimated_loss": base_lots * loss,
+            "notional_max": base_lots * entry,
+            "account_risk_pct": base_lots * loss / equity * 100}
 
 
 def validate_plan(plan, data):
@@ -374,9 +382,9 @@ def build_plan(data, direction=None):
             "structure_boundary": boundary, "hold_hours": HOLD_HOURS,
             "timeout_action": "人工复核剩余仓位，信号走弱则退出；不因横盘扩大止损",
             "signal_close_ms": data["signal_close_ms"], "created_at_ms": int(time.time()*1000),
-            "market": MARKET, "stop_trigger": "CONTRACT_PRICE",
+            "market": MARKET, "stop_trigger": "标记价格(MARK_PRICE)",
             "account_risk_pct": ACCOUNT_RISK * 100,
-            **{key: data[key] for key in ["qty_step", "min_qty", "max_qty", "min_notional"]}}
+            **{key: data[key] for key in ["qty_step", "min_qty", "max_qty", "min_notional", "ct_val"]}}
     plan.update(validate_plan(plan, data))
     return plan
 

@@ -147,7 +147,7 @@
      'test_strategy_market.py' -v` 全过; mock 全 OKX 端点, 覆盖
      未收盘 K 线不进指标、行情过期拒绝、费率缺失拒绝、张数/步长校验、
      HTTP 失败无跨市场回退。
-2. [ ] 适配点位/成本/仓位到 OKX 合约语义( ctVal 换算、张数取整、
+2. [x] 适配点位/成本/仓位到 OKX 合约语义( ctVal 换算、张数取整、
      最小张数 minSz、费率方向与结算次数按 8h)。
    - 验收: test_strategy_levels.py 全过(必要处适配张数断言); 净盈亏比
      计算含 ctVal 与费率周期。

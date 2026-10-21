@@ -49,9 +49,22 @@ class LevelTests(unittest.TestCase):
             result=s.risk_size(plan,1000)
             self.assertLessEqual(result["estimated_loss"],5)
             self.assertLessEqual(result["notional_max"],1000)
-            self.assertAlmostEqual(result["qty"],s.round_tick(result["qty"],data["qty_step"]))
             for key in ("stop","tp1","tp2","entry_min","entry_max"):
                 self.assertAlmostEqual(plan[key],s.round_tick(plan[key],data["tick_size"]))
+
+    def test_lots_semantics_and_min_order(self):
+        # OKX 张数语义: qty 是整数张, base_qty = 张数 * ctVal 个币
+        data,plan=self.make()
+        result=s.risk_size(plan,1000)
+        self.assertEqual(result["qty"],int(result["qty"]))
+        self.assertAlmostEqual(result["base_qty"],result["qty"]*data["ct_val"])
+        self.assertAlmostEqual(result["notional_max"],result["base_qty"]*plan["entry_max"])
+        # 最小张数 minSz 与最小名义都不满足时拒绝
+        tiny={"ct_val":data["ct_val"],"qty_step":data["qty_step"],
+              "min_qty":1e9,"max_qty":data["max_qty"],"min_notional":1e9,
+              "loss_per_unit":plan["loss_per_unit"],"entry_max":plan["entry_max"],
+              "entry_min":plan["entry_min"]}
+        with self.assertRaises(s.StrategyRejected): s.risk_size(tiny,1000)
 
     def test_tiny_account_not_forced_to_minimum_order(self):
         _,plan=self.make()
