@@ -1,3 +1,4 @@
+import html
 import unittest
 from unittest.mock import patch
 
@@ -160,3 +161,50 @@ class FlowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EscapeAndDedupTests(unittest.TestCase):
+    def test_event_notice_escapes_html(self):
+        """AI 复核 detail 含 <script> 时必须被转义, 否则 TG 400"""
+        import tracker as t
+        sig = {"symbol": "BTC/USDT", "direction": "long", "entry_price": 100.0,
+               "last_price": 101.0, "pnl_now": 1.0, "mfe": 1.5,
+               "strategy": {"stop": 97.0}, "alerts_fired": []}
+        events = [{"sig": sig, "type": "alert", "reason": "ai_review",
+                   "detail": "<script>alert(1)</script> 利空突袭"}]
+        with patch.object(radar, "TG_BOT_TOKEN", "t"), \
+             patch.object(radar, "TG_CHAT_ID", "c"), \
+             patch.object(radar.requests, "post") as post:
+            radar.send_event_notice(events)
+        sent = post.call_args.kwargs["json"]["text"]
+        self.assertNotIn("<script>", sent)                     # 原文标签不可见
+        self.assertIn(html.escape("<script>alert(1)</script>"), sent)
+        self.assertIn("利空突袭", sent)
+
+    def test_ai_review_dedups_headlines_and_repeated_verdicts(self):
+        """同一批旧头条不再重复复核报警; 结论与上次相同不重复推"""
+        store = {"signals": [{"symbol": "BTC/USDT", "direction": "long", "status": "active",
+                              "entry_price": 100.0, "pnl_now": 0.5, "mfe": 1.2,
+                              "last_ai_review": None, "alerts_fired": [],
+                              "seen_headlines": [], "last_ai_verdict": None,
+                              "strategy": None}]}
+        events = []
+        data = {"price": 100.5, "4h_adx": 30., "funding_rate_pct": 0.01}
+        with patch.object(radar, "fetch_news_headlines",
+                          return_value=["旧闻A", "旧闻B"]), \
+             patch.object(radar, "get_macro_sentiment", return_value="50"), \
+             patch.object(radar, "get_market_data", return_value=data), \
+             patch.object(radar, "ask_ai_review",
+                          side_effect=["监管利空", "监管利空", "新风险"]) as ask:
+            radar.review_signals_with_ai(store, events)
+            self.assertEqual(len(events), 1)          # 首次结论推一次
+            self.assertEqual(sorted(store["signals"][0]["seen_headlines"]), ["旧闻A", "旧闻B"])
+            # 第二轮: 头条没变(全是 seen), 结论相同 -> 不推
+            store["signals"][0]["last_ai_review"] = None
+            radar.review_signals_with_ai(store, events)
+            self.assertEqual(len(events), 1)
+            # 第三轮: 结论变了 -> 推
+            store["signals"][0]["last_ai_review"] = None
+            radar.review_signals_with_ai(store, events)
+            self.assertEqual(len(events), 2)
+            self.assertEqual(events[-1]["detail"], "新风险")

@@ -1,5 +1,6 @@
 import os
 import time
+import html
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
@@ -14,46 +15,46 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# 本机出口 IP 被币安主站按地域封锁(HTTP 451), K线改走币安官方公开行情镜像;
-# 资金费率主站同样被封, 改用 OKX 同品种 U 本位永续的费率作参考(2026-10 确认可用)
-BINANCE_MIRROR = "https://data-api.binance.vision"
+# 2026-10-21 整体迁移 OKX: 新策略(strategy.py)与追踪层(本文件)同源,
+# 单一 OKX 数据源无回退 —— 回退币安会重新引入跨市场基差错位
 OKX_API = "https://www.okx.com"
 
-# ================= 2. 权威数据抓取与指标计算 =================
-def fetch_klines(symbol, interval, limit):
-    """从币安公开行情镜像拉取 K 线 (无需 API Key)"""
-    pair = symbol.replace('/', '')
-    res = requests.get(
-        f"{BINANCE_MIRROR}/api/v3/klines",
-        params={"symbol": pair, "interval": interval, "limit": limit},
-        timeout=15,
-    )
+# ================= 2. 追踪层行情抓取(OKX)与指标计算 =================
+def _okx_klines(symbol, interval, limit):
+    """OKX 永续 K 线。interval: '4h'/'1h'/'15m'(OKX bar 格式)。
+    返回升序 DataFrame, 含未收盘 bar(confirm 列区分), 由调用方取舍。
+    OKX v5: {"code":"0","data":[[ts,o,h,l,c,vol,...,confirm],...]} 倒序。"""
+    inst_id = symbol.replace('/USDT', '-USDT-SWAP')
+    bar = {'4h': '4H', '1h': '1H', '15m': '15m'}[interval]
+    res = requests.get(f"{OKX_API}/api/v5/market/candles",
+                       params={"instId": inst_id, "bar": bar, "limit": min(limit, 300)},
+                       timeout=15)
     res.raise_for_status()
-    rows = res.json()
-    # 币安 klines 实际返回 12 列, 只取前 6 列 (time/open/high/low/close/volume)
-    df = pd.DataFrame([row[:6] for row in rows],
+    body = res.json()
+    if body.get("code") != "0" or not body.get("data"):
+        raise ValueError(f"OKX K线拉取失败 code={body.get('code')}")
+    rows = body["data"][::-1]  # 倒序 -> 升序
+    df = pd.DataFrame([r[:6] for r in rows],
                       columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df["confirmed"] = [str(r[8]) == "1" for r in rows]
     return df.astype(float)
 
+
+def fetch_klines(symbol, interval, limit):
+    """追踪层 4H/1H 指标用 K 线(升序, 含未收盘 bar, 调用方过滤)"""
+    return _okx_klines(symbol, interval, limit)
+
+
 def fetch_klines_since(symbol, interval, start_ms):
-    """从币安镜像拉取 start_ms(毫秒时间戳)之后的 K 线, 供追踪模块扫描
-    上次检查以来的插针。窗口上限按 24h(Actions 故障重启后兜底)。"""
-    pair = symbol.replace('/', '')
-    res = requests.get(
-        f"{BINANCE_MIRROR}/api/v3/klines",
-        params={"symbol": pair, "interval": interval,
-                "startTime": start_ms, "limit": 96},
-        timeout=15,
-    )
-    res.raise_for_status()
-    rows = res.json()
-    df = pd.DataFrame([row[:6] for row in rows],
-                      columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    return df.astype(float)
+    """拉取 start_ms(毫秒)之后的 15m K 线, 供追踪模块扫描上次检查以来的插针。
+    一次拉 300 根 15m(=75h, 覆盖 48h 追踪 + Actions 故障重启后的兜底窗口)。"""
+    df = _okx_klines(symbol, interval, 300)
+    return df[df['timestamp'] >= float(start_ms)].reset_index(drop=True)
 
 
 def fetch_funding_rate(symbol):
-    """从 OKX 公开接口获取同品种 U 本位永续实时资金费率, 失败返回 0"""
+    """OKX U 本位永续实时资金费率 %。失败返回 None: 预警层对 None 豁免,
+    不把"获取失败"当成零费率(与新策略口径一致)。"""
     inst_id = symbol.replace('/USDT', '-USDT-SWAP')
     try:
         res = requests.get(
@@ -63,12 +64,18 @@ def fetch_funding_rate(symbol):
         ).json()
         return round(float(res['data'][0]['fundingRate']) * 100, 4)
     except Exception:
-        return 0.0
+        return None
+
 
 def get_market_data(symbol):
-    """拉取 4H(看趋势) 和 1H(找点位) 数据并精确计算指标"""
+    """追踪层行情快照。指标只取已收盘 K 线(2026-10-21 移植: 未收盘 bar 的
+    OHLC 盘中会变, 用它算 EMA/ADX 会让排列反复闪烁, 产生假翻转结案);
+    实时价取 OKX ticker 最新成交价。"""
     df_4h = fetch_klines(symbol, '4h', 250)
     df_1h = fetch_klines(symbol, '1h', 250)
+    # 只留已收盘 K 线再算指标(OKX confirm 字段)
+    df_4h = df_4h[df_4h['confirmed'] == 1].reset_index(drop=True)
+    df_1h = df_1h[df_1h['confirmed'] == 1].reset_index(drop=True)
 
     # --- 4H 大周期趋势指标 ---
     df_4h['ema20'] = ta.ema(df_4h['close'], length=20)
@@ -88,20 +95,24 @@ def get_market_data(symbol):
     # --- 获取永续合约实时资金费率 (OKX) ---
     funding_rate = fetch_funding_rate(symbol)
 
-    c4 = df_4h.iloc[-1]
-    c1 = df_1h.iloc[-1]
+    c4 = df_4h.iloc[-1]  # 最新已收盘 4H
+    c1 = df_1h.iloc[-1]  # 最新已收盘 1H
+    inst_id = symbol.replace('/USDT', '-USDT-SWAP')
+    live = requests.get(f"{OKX_API}/api/v5/market/ticker",
+                        params={"instId": inst_id}, timeout=15).json()
+    price = float(live['data'][0]['last'])
 
     return {
         "symbol": symbol,
-        "price": round(float(c1['close']), 2),
-        "4h_ema20": round(float(c4['ema20']), 2),
-        "4h_ema50": round(float(c4['ema50']), 2),
-        "4h_ema200": round(float(c4['ema200']), 2),
+        "price": round(price, 4),
+        "4h_ema20": round(float(c4['ema20']), 4),
+        "4h_ema50": round(float(c4['ema50']), 4),
+        "4h_ema200": round(float(c4['ema200']), 4),
         "4h_adx": round(float(c4['adx']), 1),
         "1h_rsi": round(float(c1['rsi']), 1),
-        "1h_atr": round(float(c1['atr']), 2),
-        "24h_high": round(float(c1['recent_high']), 2),
-        "24h_low": round(float(c1['recent_low']), 2),
+        "1h_atr": round(float(c1['atr']), 4),
+        "24h_high": round(float(c1['recent_high']), 4),
+        "24h_low": round(float(c1['recent_low']), 4),
         "funding_rate_pct": funding_rate
     }
 
@@ -125,7 +136,7 @@ def ai_veto_check(plan, fng):
     prompt = f"""
 你是加密货币策略风控参谋。规则系统按以下已通过全部机械校验的计划准备推送一条交易策略：
 
-- 币种：{plan.get('symbol', '')}（Binance USDT 永续）
+- 币种：{plan.get('symbol', '')}（OKX USDT 永续）
 - 方向：{'做多' if plan['direction'] == 'long' else '做空'}
 - 入场区间：{plan['entry_min']} – {plan['entry_max']}
 - 硬止损：{plan['stop']}；TP1 {plan['tp1']} / TP2 {plan['tp2']}
@@ -160,7 +171,7 @@ def send_telegram_msg(symbol, price, strategy_text, direction="long"):
         f"<b>信号类型：</b>顺势{'做多' if direction == 'long' else '做空'}"
         f"（4H 趋势确立 + 1H 回踩确认，点位由规则生成）\n\n"
         f"{strategy_text}\n\n"
-        f"数据来源：Binance USDT 永续 | {time.strftime('%Y-%m-%d %H:%M')}"
+        f"数据来源：OKX USDT 永续 | {time.strftime('%Y-%m-%d %H:%M')}"
     )
     # TG 单条消息上限 4096 字符
     if len(text) > 4000:
@@ -202,6 +213,9 @@ def review_signals_with_ai(store, events):
 
     节流时间戳必须落盘到档案(last_ai_review): job 内循环每轮巡检都是
     新 python 进程, 进程内字典会清零, 落盘前实测每 20 分钟就复核一次。
+    2026-10-21 移植: 头条按 seen_headlines 增量去重 —— 否则同一批旧闻
+    每 2h 就被当作"新消息"重复报警; 结论与上次相同(last_ai_verdict)
+    也不重复推, 只有新的判断才值得打扰。
     """
     now = datetime.now(tracker.BJ_TZ)
     to_review = []
@@ -215,11 +229,17 @@ def review_signals_with_ai(store, events):
     fng = get_macro_sentiment()
     for s in to_review:
         s['last_ai_review'] = now.isoformat()
+        seen = set(s.get('seen_headlines') or [])
+        new_heads = [h for h in heads if h not in seen]
+        # 档案只留最近 20 条, 防长期增长
+        s['seen_headlines'] = list(seen.union(heads))[-20:]
         try:
             d = get_market_data(s['symbol'])
-            verdict = ask_ai_review(s, d, heads, fng)
-            if verdict:
-                s['alerts_fired'].append('ai_review')
+            verdict = ask_ai_review(s, d, new_heads, fng)
+            if verdict and verdict != s.get('last_ai_verdict'):
+                s['last_ai_verdict'] = verdict
+                if 'ai_review' not in s['alerts_fired']:
+                    s['alerts_fired'].append('ai_review')
                 events.append({"sig": s, "type": "alert", "reason": "ai_review",
                                "detail": verdict})
         except Exception as e:
@@ -228,7 +248,7 @@ def review_signals_with_ai(store, events):
 
 def ask_ai_review(sig, d, heads, fng):
     """单信号 AI 复核: 返回异常描述(触发预警)或 None(正常持有)。"""
-    news = "\n".join(f"- {h}" for h in heads) or "(暂无可用头条)"
+    news = "\n".join(f"- {h}" for h in heads) or "(自上次复核以来暂无新头条)"
     prompt = f"""你是加密货币持仓风控参谋。我在{'做空' if sig['direction']=='short' else '做多'} {sig['symbol']}，入场价 {sig['entry_price']}，
 当前价 {d['price']}，浮盈 {sig['pnl_now']:+.2f}%（期间峰值 {sig['mfe']:+.2f}%）。
 4H ADX={d['4h_adx']}，资金费率 {d['funding_rate_pct']}%，恐慌贪婪指数 {fng}。
@@ -274,13 +294,19 @@ def send_event_notice(events):
                 exits.append(e)
         else:
             alerts.append(e)
+    # HTML parse_mode: 所有动态文本必须转义, 否则 AI/新闻文本里的 < > &
+    # 会让 TG 返回 400(2026-10-21 移植; symbol/文案当前为受控字符, 转义是无害兜底)
+    def esc(x):
+        return html.escape(str(x))
+
     lines = []
     for e in urgent:
         s = e['sig']
+        stop_val = s['strategy']['stop'] if s.get('strategy') else '无'
         lines.append(
-            f"⚠️ <b>{s['symbol']} 趋势排列已翻转但止损未触发</b>\n"
+            f"⚠️ <b>{esc(s['symbol'])} 趋势排列已翻转但止损未触发</b>\n"
             f"{'做空' if s['direction'] == 'short' else '做多'} @{s['entry_price']} "
-            f"现价 {s['last_price']} (浮盈 {s['pnl_now']:+.2f}%, 止损位 {s['strategy']['stop']})\n"
+            f"现价 {s['last_price']} (浮盈 {s['pnl_now']:+.2f}%, 止损位 {stop_val})\n"
             f"止损单不会保护你——别等止损, 尽快人工决策离场。"
         )
     if exits:
@@ -293,10 +319,10 @@ def send_event_notice(events):
                 'took_profit': "止盈离场",
                 'trend_reversed': "趋势翻转离场", 'timeout': "追踪满48h关闭",
                 'manual_reset': "人工清仓重置",
-            }.get(e['reason'], e['reason'])
+            }.get(e['reason'], str(e['reason']))
             mech = "" if s.get('strategy') else "（无点位存档, 机械口径）"
             lines.append(
-                f"{s['symbol']} {'做空' if s['direction'] == 'short' else '做多'}"
+                f"{esc(s['symbol'])} {'做空' if s['direction'] == 'short' else '做多'}"
                 f" @{s['entry_price']}: {reason} | 最终 {s['pnl_now']:+.2f}%"
                 f" | 峰值 {s['mfe']:+.2f}%{mech}"
             )
@@ -315,11 +341,11 @@ def send_event_notice(events):
             elif e['reason'] == 'funding':
                 detail = "资金费率出现逆势深值, 该方向拥挤, 有轧空/踩踏风险"
             elif e['reason'] == 'ai_review':
-                detail = f"AI 消息面复核: {e.get('detail', '')}"
+                detail = f"AI 消息面复核: {esc(e.get('detail', ''))}"
             else:
                 detail = "4H ADX 跌破 22, 趋势动能消散, 留意假突破"
             lines.append(
-                f"{s['symbol']} {'做空' if s['direction'] == 'short' else '做多'}"
+                f"{esc(s['symbol'])} {'做空' if s['direction'] == 'short' else '做多'}"
                 f" @{s['entry_price']}: {detail}"
             )
     requests.post(
@@ -344,7 +370,7 @@ def run_scan():
     candidates = []
     for sym in SYMBOLS:
         try:
-            # 新策略用 Binance 永续公开行情(strategy.py 独立数据入口);
+            # 新策略用 OKX 永续公开行情(strategy.py 独立数据入口);
             # get_market_data 仅保留给追踪层, 与新策略解耦
             data = strategy.get_strategy_market_data(sym)
             signal = strategy.signal_direction(data)

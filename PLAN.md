@@ -156,7 +156,7 @@
    - 验收: 新增 tests/test_tracker.py: 触 TP1 后回撤保本结案记 0.5*TP1、
      未 TP1 回撤仍记全额止损、开仓前插针不误判、旧档案字段迁移;
      update_open_signals 现有行为不回归。
-4. [ ] crypto_radar.py 追踪层数据源换 OKX( get_market_data/
+4. [x] crypto_radar.py 追踪层数据源换 OKX( get_market_data/
      fetch_klines_since/ fetch_funding_rate 失败返回 None 并由预警层
      豁免) + send_event_notice/html 全量转义 + AI 复核增量去重。
    - 验收: tests/test_strategy_flow.py 全过(mock OKX 行情入口); 手工
