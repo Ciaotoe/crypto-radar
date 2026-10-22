@@ -1,6 +1,6 @@
 import html
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import strategy as s
 from strategy_fixtures import market, clock
@@ -35,14 +35,19 @@ class FlowTests(unittest.TestCase):
         market_data: get_strategy_market_data 的 side_effect 序列
         (3 币种扫描 + 推送前复核), veto: ai_veto_check 返回值。"""
         events = events or []
+        universe = {"version": "u-test",
+                    "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+                    "members": {"BTC/USDT": 1, "ETH/USDT": 2, "SOL/USDT": 3}}
         with patch.object(radar, "get_macro_sentiment", return_value="70 (Greed)"), \
              patch.object(radar, "send_telegram_msg") as send, \
              patch.object(radar, "ai_veto_check", return_value=veto) as check, \
+             patch.object(radar.universe, "load_or_refresh", return_value=universe), \
              patch.object(radar.tracker, "load_signals", return_value=store), \
              patch.object(radar.tracker, "save_signals") as save, \
              patch.object(radar, "review_signals_with_ai"), \
              patch.object(radar.tracker, "update_open_signals",
                           return_value=(False, events)), \
+             patch.object(radar.strategy, "load_quote_snapshot", return_value=None), \
              patch.object(radar.strategy, "get_strategy_market_data",
                           side_effect=market_data):
             radar.run_scan()
@@ -87,12 +92,15 @@ class FlowTests(unittest.TestCase):
         flipped["4h_close"] = flipped["4h_close"] - 3
         with self.assertRaisesRegex(s.StrategyRejected, "方向"):
             s.ensure_pushable(plan, flipped)
-        # 现价跑出入场区间 -> 拒绝(不现场改点位):
-        # 缩小计划区间模拟"扫描后价格已跑远", 行情本身仍成立
-        moved = {**plan, "entry_min": plan["entry_min"] + 10,
-                 "entry_max": plan["entry_max"] + 10}
-        with self.assertRaisesRegex(s.StrategyRejected, "入场区间"):
-            s.ensure_pushable(moved, data)
+        # 现价已越过止损 -> 拒绝(不现场改点位)
+        beyond_stop = {**plan, "stop": data["price"] + .5}
+        with self.assertRaisesRegex(s.StrategyRejected, "止损"):
+            s.ensure_pushable(beyond_stop, data)
+        # 现价远离入场带超过 1 ATR -> 拒绝追价; 带外但未越止损仍允许等回踩
+        far = {**plan, "entry_min": plan["entry_min"] - 20,
+               "entry_max": plan["entry_max"] - 20}
+        with self.assertRaisesRegex(s.StrategyRejected, "远离"):
+            s.ensure_pushable(far, data)
         # 正常: 新鲜行情仍成立且价格在区间内 -> 放行
         self.assertEqual(s.ensure_pushable(plan, data), data)
 
@@ -121,6 +129,11 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(sig["strategy"]["stop"], plan["stop"])
         self.assertEqual(sig["strategy"]["tp2"], plan["tp2"])
         self.assertIn("entry_min", sig["strategy"])
+        self.assertEqual(sig["entry_model"], "pending")
+        self.assertIsNone(sig["entry_filled_at"])
+        self.assertEqual(sig["push_price"], fresh["price"])
+        self.assertEqual(sig["universe_version"], "u-test")
+        self.assertTrue(sig["stats_eligible"])
         # 推送文案由规则点位渲染, 与档案 text 一致, 不经过模型
         text = send.call_args.args[2]
         self.assertIn(f"TP2 {plan['tp2']:.2f}", text)
@@ -137,15 +150,29 @@ class FlowTests(unittest.TestCase):
         save.assert_called_once()
         self.assertEqual(store["signals"], [])  # 否决即不建档
 
-    def test_open_signal_blocks_new_push(self):
+    def test_full_slots_block_new_push(self):
         data, plan = self.make()
-        held = {"symbol": "ETH/USDT", "direction": "short", "status": "active",
-                "strategy": {"stop": 1}, "alerts_fired": []}
-        store = {"signals": [held]}
+        held = [{"symbol": symbol, "direction": "short", "status": "active",
+                 "strategy": {"stop": 1}, "alerts_fired": [], "risk_pct": .5}
+                for symbol in ("ETH/USDT", "SOL/USDT", "XRP/USDT")]
+        store = {"signals": held}
         send, check, save = self.run_scan_with(
             store, [data, s.StrategyRejected("x"), s.StrategyRejected("x")])
         self.assertFalse(send.called)
-        self.assertEqual(len(store["signals"]), 1)  # 不建新档案
+        self.assertEqual(len(store["signals"]), 3)  # 不建新档案
+
+    def test_slot_gate_same_direction_and_total_risk(self):
+        def held(direction, risk):
+            return {"symbol": f"{direction}-{risk}", "direction": direction,
+                    "status": "active", "strategy": {}, "alerts_fired": [],
+                    "account_risk_pct": risk}
+        store = {"signals": [held("long", .5), held("long", .5)]}
+        ok, why = radar.slot_available(store, "long", .5)
+        self.assertFalse(ok)
+        self.assertIn("方向", why)
+        self.assertTrue(radar.slot_available(store, "short", .5)[0])
+        store["signals"].append(held("short", .5))
+        self.assertFalse(radar.slot_available(store, "short", .5)[0])
 
     def test_veto_failure_allows_push(self):
         data, plan = self.make()
@@ -191,20 +218,35 @@ class EscapeAndDedupTests(unittest.TestCase):
         events = []
         data = {"price": 100.5, "4h_adx": 30., "funding_rate_pct": 0.01}
         with patch.object(radar, "fetch_news_headlines",
-                          return_value=["旧闻A", "旧闻B"]), \
+                          side_effect=[["旧闻A", "旧闻B"], ["旧闻A", "旧闻B"],
+                                       ["旧闻A", "旧闻B", "突发C"]]), \
              patch.object(radar, "get_macro_sentiment", return_value="50"), \
              patch.object(radar, "get_market_data", return_value=data), \
              patch.object(radar, "ask_ai_review",
-                          side_effect=["监管利空", "监管利空", "新风险"]) as ask:
+                          side_effect=["监管利空", "新风险"]) as ask:
             radar.review_signals_with_ai(store, events)
             self.assertEqual(len(events), 1)          # 首次结论推一次
             self.assertEqual(sorted(store["signals"][0]["seen_headlines"]), ["旧闻A", "旧闻B"])
-            # 第二轮: 头条没变(全是 seen), 结论相同 -> 不推
-            store["signals"][0]["last_ai_review"] = None
+            # 第二轮: 头条没变、无机械事件、未到 24h 兜底 -> 不调用
             radar.review_signals_with_ai(store, events)
             self.assertEqual(len(events), 1)
-            # 第三轮: 结论变了 -> 推
-            store["signals"][0]["last_ai_review"] = None
+            self.assertEqual(ask.call_count, 1)
+            # 第三轮: 出现新头条 -> 复核, 结论变化 -> 推
             radar.review_signals_with_ai(store, events)
             self.assertEqual(len(events), 2)
             self.assertEqual(events[-1]["detail"], "新风险")
+
+    def test_heartbeat_is_opt_in_and_never_raises(self):
+        """心跳默认关闭; 开启后推送失败也不能影响巡检"""
+        with patch.object(radar, "HEARTBEAT_ENABLED", False), \
+             patch.object(radar.requests, "post") as post:
+            radar.send_heartbeat(True, "ok")
+        post.assert_not_called()
+
+        failing = Mock()
+        failing.raise_for_status.side_effect = RuntimeError("tg down")
+        with patch.object(radar, "HEARTBEAT_ENABLED", True), \
+             patch.object(radar, "TG_BOT_TOKEN", "t"), \
+             patch.object(radar, "TG_CHAT_ID", "c"), \
+             patch.object(radar.requests, "post", return_value=failing):
+            radar.send_heartbeat(False, "boom")

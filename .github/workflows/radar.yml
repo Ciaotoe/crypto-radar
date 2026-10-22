@@ -1,11 +1,8 @@
 name: crypto-radar
 
 on:
-  schedule:
-    # GitHub Actions 对高频 scheduled cron 会延迟/丢拍(实测中位间隔 144 分钟),
-    # 改为每小时拉起一次, 20 分钟节奏由 job 内循环保证
-    - cron: '3 * * * *'
-  workflow_dispatch: {}  # 允许手动触发测试
+  # 定时调度已迁到 VPS(systemd 常驻循环); 这里只保留手动触发做应急/验证
+  workflow_dispatch: {}
 
 permissions:
   contents: write  # 允许运行结束把 signals.json 变化提交回仓库
@@ -22,29 +19,31 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Sync dependencies
+        run: uv sync --frozen
+
       - name: Run radar
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        # 单次巡检 20 秒左右, 每轮后 sleep 到下一档再跑, 共 3 轮约 1 小时,
-        # 由下一次 cron 拉起接力; 单轮异常不中断后续轮次
+        # 手动触发时跑 3 轮, 每轮后 sleep 20 分钟; 单轮异常不中断后续轮次
         run: |
           for i in 1 2 3; do
             echo "=== 第 $i 轮巡检 $(date -u '+%Y-%m-%d %H:%M:%SZ') ==="
-            uv run crypto_radar.py || echo "第 $i 轮巡检失败, 继续下一轮"
+            uv run --no-sync crypto_radar.py || echo "第 $i 轮巡检失败, 继续下一轮"
             if [ "$i" -lt 3 ]; then sleep 1200; fi
           done
 
-      # 仓库即数据库: 把信号档案变化提交回 main, 供下次运行读取
-      # 放循环外统一提交一次(轮内档案内存已连续更新, 落盘是最终状态)。
-      # 巡检循环拉长了运行窗口, 与人工推送撞车概率变高: push 被拒时
-      # rebase 远端后重试(signals.json 是我们唯一改动的文件, 无真冲突)
+      # 手动触发时把状态提交回 main, 供下次运行读取; 放循环外统一提交一次。
+      # push 被拒时 rebase 远端后重试; 状态文件由本 job 独占写入。
       - name: Commit signal data
         run: |
           git config user.name "radar-bot"
           git config user.email "radar-bot@users.noreply.github.com"
           git add data/signals.json
-          git diff --cached --quiet || git commit -m "data: update signal tracking [skip ci]"
+          if [ -f data/universe.json ]; then git add data/universe.json; fi
+          if [ -f data/signals_archive.json ]; then git add data/signals_archive.json; fi
+          git diff --cached --quiet || git commit -m "data: update radar state [skip ci]"
           git pull --rebase origin main
           git push

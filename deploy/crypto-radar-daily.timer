@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily crypto-radar summary at 08:00 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 08:00:30 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=crypto-radar-daily.service
+
+[Install]
+WantedBy=timers.target

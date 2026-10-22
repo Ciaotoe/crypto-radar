@@ -1,0 +1,19 @@
+[Unit]
+Description=Send crypto-radar daily summary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=crypto-radar
+Group=crypto-radar
+WorkingDirectory=/opt/crypto-radar
+EnvironmentFile=/etc/crypto-radar.env
+Environment=TZ=Asia/Shanghai
+ExecStart=/usr/local/bin/uv run --no-sync daily_heartbeat.py
+TimeoutStartSec=2min
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal

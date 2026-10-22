@@ -1,0 +1,17 @@
+[Unit]
+Description=Backup crypto-radar state
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=crypto-radar
+Group=crypto-radar
+Environment=REPO_DIR=/opt/crypto-radar
+Environment=BACKUP_DIR=/var/backups/crypto-radar
+Environment=KEEP_DAYS=30
+ExecStart=/usr/local/sbin/crypto-radar-backup
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
