@@ -7,13 +7,19 @@ import pandas as pd
 import pandas_ta as ta
 import tracker
 import strategy
+import universe
+from runtime import AlreadyRunning, single_instance_lock
 
 # ================= 1. 核心配置区 =================
-SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
+MAX_OPEN = 3
+MAX_SAME_DIRECTION = 2
+MAX_TOTAL_RISK_PCT = 1.5
+LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'radar.lock')
 # 通过环境变量注入(本地 .env 或 GitHub Actions Secrets), 勿在代码里写死密钥
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+HEARTBEAT_ENABLED = os.getenv("RADAR_HEARTBEAT", "0") == "1"
 
 # 2026-10-21 整体迁移 OKX: 新策略(strategy.py)与追踪层(本文件)同源,
 # 单一 OKX 数据源无回退 —— 回退币安会重新引入跨市场基差错位
@@ -200,50 +206,75 @@ def fetch_news_headlines():
         return []
 
 
-# AI 复核间隔(小时): 消息面变化通常数小时内兑现到价格, 2h 在轧空等快速
-# 行情里能抢在排列翻转前提醒(2026-10-19 与用户确认 4h 太久)。可经环境变量调整
-AI_REVIEW_HOURS = float(os.getenv("RADAR_AI_REVIEW_HOURS", "2"))
-# 复核节流时间戳存档案字段 last_ai_review(进程内字典会随 job 内每轮巡检清零)
+# 事件驱动复核 + 24h 兜底: 新头条、机械预警、或距上次成功复核满 24h 才调用。
+# last_ai_review / seen_headlines 只在调用成功后更新, 失败下轮重试。
+AI_REVIEW_FLOOR_HOURS = float(os.getenv("RADAR_AI_REVIEW_FLOOR_HOURS", "24"))
+MAX_AI_REVIEWS_PER_SCAN = int(os.getenv(
+    "RADAR_AI_MAX_CALLS_PER_SCAN",
+    os.getenv("RADAR_MAX_AI_REVIEWS_PER_SCAN", "2")))
+
+
+def _merge_headlines(old, heads):
+    """保留时间序并去重, 只留最近 20 条。"""
+    merged = list(old or [])
+    for head in heads:
+        if head in merged:
+            merged.remove(head)
+        merged.append(head)
+    return merged[-20:]
 
 
 def review_signals_with_ai(store, events):
-    """在持信号每 AI_REVIEW_HOURS 做一次消息面复核(真正看新闻的那一层)。
-    机械规则覆盖不到的阴跌/消息面异动, 由大模型基于头条+费率+FNG 判断;
-    只产出 alert 事件, 结案权仍在机械层。API 调用有节流, 无单时不调用。
-
-    节流时间戳必须落盘到档案(last_ai_review): job 内循环每轮巡检都是
-    新 python 进程, 进程内字典会清零, 落盘前实测每 20 分钟就复核一次。
-    2026-10-21 移植: 头条按 seen_headlines 增量去重 —— 否则同一批旧闻
-    每 2h 就被当作"新消息"重复报警; 结论与上次相同(last_ai_verdict)
-    也不重复推, 只有新的判断才值得打扰。
-    """
+    """在持信号的事件驱动消息面复核; 无单/无事件/无新头条且未到兜底不调用。
+    只产出 alert 事件, 结案权仍在机械层。返回本轮新闻快照供新信号初始化。"""
     now = datetime.now(tracker.BJ_TZ)
-    to_review = []
-    for s in open_signals(store):
-        last = s.get('last_ai_review')
-        if last is None or now - datetime.fromisoformat(last) >= timedelta(hours=AI_REVIEW_HOURS):
-            to_review.append(s)
-    if not to_review:
-        return
+    active = [s for s in open_signals(store)
+              if s.get('entry_model') != 'pending' or s.get('entry_filled_at')]
+    if not active:
+        return None
     heads = fetch_news_headlines()
     fng = get_macro_sentiment()
-    for s in to_review:
-        s['last_ai_review'] = now.isoformat()
+    alert_ids = {id(e.get('sig')) for e in events
+                 if e.get('type') == 'alert' and e.get('reason') != 'ai_review'}
+    due = []
+    for s in active:
         seen = set(s.get('seen_headlines') or [])
         new_heads = [h for h in heads if h not in seen]
-        # 档案只留最近 20 条, 防长期增长
-        s['seen_headlines'] = list(seen.union(heads))[-20:]
+        last = s.get('last_ai_review')
+        try:
+            last_dt = datetime.fromisoformat(last) if last else None
+        except ValueError:
+            last_dt = None
+        due_floor = last_dt is None or now - last_dt >= timedelta(hours=AI_REVIEW_FLOOR_HOURS)
+        # 优先级: 机械预警 > 新头条 > 24h 兜底; 被跳过的信号下轮仍 due
+        if id(s) in alert_ids:
+            due.append((0, s, new_heads))
+        elif new_heads:
+            due.append((1, s, new_heads))
+        elif due_floor:
+            due.append((2, s, new_heads))
+    due.sort(key=lambda item: item[0])
+    reviews = 0
+    for _, s, new_heads in due:
+        if reviews >= MAX_AI_REVIEWS_PER_SCAN:
+            break
+        reviews += 1
         try:
             d = get_market_data(s['symbol'])
             verdict = ask_ai_review(s, d, new_heads, fng)
+            s['last_ai_review'] = now.isoformat()
+            s['seen_headlines'] = _merge_headlines(s.get('seen_headlines'), heads)
             if verdict and verdict != s.get('last_ai_verdict'):
                 s['last_ai_verdict'] = verdict
                 if 'ai_review' not in s['alerts_fired']:
                     s['alerts_fired'].append('ai_review')
                 events.append({"sig": s, "type": "alert", "reason": "ai_review",
                                "detail": verdict})
+            elif not verdict:
+                s['last_ai_verdict'] = None
         except Exception as e:
             print(f"[{s['symbol']}] AI 复核异常: {e}")
+    return heads
 
 
 def ask_ai_review(sig, d, heads, fng):
@@ -318,6 +349,7 @@ def send_event_notice(events):
                 'breakeven_after_tp1': "TP1减仓后回撤保本离场",
                 'took_profit': "止盈离场",
                 'trend_reversed': "趋势翻转离场", 'timeout': "追踪满48h关闭",
+                'not_entered': "挂单窗口内未成交，已失效",
                 'manual_reset': "人工清仓重置",
             }.get(e['reason'], str(e['reason']))
             mech = "" if s.get('strategy') else "（无点位存档, 机械口径）"
@@ -355,24 +387,87 @@ def send_event_notice(events):
     ).raise_for_status()
 
 
-def run_scan():
-    if not TG_BOT_TOKEN or not TG_CHAT_ID or not GEMINI_API_KEY:
-        raise SystemExit("TG_BOT_TOKEN / TG_CHAT_ID / GEMINI_API_KEY 未设置")
+def _redact(text):
+    text = str(text)
+    for secret in (TG_BOT_TOKEN, GEMINI_API_KEY):
+        if secret:
+            text = text.replace(secret, '<redacted>')
+    return text
 
+
+def send_heartbeat(ok, detail=""):
+    """VPS 可选的每轮心跳; 失败只写日志, 不影响巡检结果。"""
+    if not HEARTBEAT_ENABLED or not TG_BOT_TOKEN or not TG_CHAT_ID:
+        return
+    stamp = datetime.now(tracker.BJ_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    icon = "✅" if ok else "❌"
+    text = f"{icon} crypto-radar 巡检{'完成' if ok else '失败'} {stamp}"
+    if detail:
+        text += f"\n{_redact(detail)[:300]}"
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text}, timeout=10
+        ).raise_for_status()
+    except Exception as exc:
+        print(f"心跳推送失败: {type(exc).__name__}")
+
+
+def open_risk_pct(store):
+    return sum(float(s.get('account_risk_pct') or 0) for s in open_signals(store))
+
+
+def slot_available(store, direction, risk_pct):
+    active = open_signals(store)
+    if len(active) >= MAX_OPEN:
+        return False, f"并发槽已满({MAX_OPEN})"
+    same = sum(1 for s in active if s.get('direction') == direction)
+    if same >= MAX_SAME_DIRECTION:
+        return False, f"{direction} 方向已达上限({MAX_SAME_DIRECTION})"
+    risk = float(risk_pct or 0)
+    if open_risk_pct(store) + risk > MAX_TOTAL_RISK_PCT + 1e-9:
+        return False, f"总计划风险超过 {MAX_TOTAL_RISK_PCT}%"
+    return True, ""
+
+
+def _scan_locked():
     # 先更新历史信号档案: 结案/预警事件攒起来最后合并推一条
     store = tracker.load_signals()
+    if not store.get('stats_epoch'):
+        store['stats_epoch'] = datetime.now(tracker.BJ_TZ).isoformat()
     _, events = tracker.update_open_signals(store, get_market_data, fetch_klines_since)
-    # 在持信号的消息面复核(带节流, 有单才调用 API)
-    review_signals_with_ai(store, events)
+    # 在持信号的事件驱动消息面复核(无事件/新闻/兜底不调用 API)
+    news_snapshot = review_signals_with_ai(store, events)
 
     fng = get_macro_sentiment()
-    # 全币种先扫描完再择优: 一次只推一个策略, 避免同时来好几单无从选择
+    try:
+        pool = universe.load_or_refresh()
+    except Exception as e:
+        print(f"[*] 动态标的池不可用，本轮不推新策略: {e}")
+        if events:
+            try:
+                send_event_notice(events)
+            except Exception as exc:
+                print(f"事件通知推送失败: {exc}")
+        tracker.archive_closed_signals(store)
+        tracker.save_signals(store)
+        return {'open': len(open_signals(store)), 'events': len(events),
+                'universe': 'unavailable'}
+    members = pool.get('members', {})
+    symbols = pool['symbols']
+    quote_snapshot = None
+    try:
+        quote_snapshot = strategy.load_quote_snapshot()
+    except Exception as e:
+        print(f"[*] 批量行情获取失败，回退逐币行情: {e}")
     candidates = []
-    for sym in SYMBOLS:
+    for sym in symbols:
         try:
-            # 新策略用 OKX 永续公开行情(strategy.py 独立数据入口);
-            # get_market_data 仅保留给追踪层, 与新策略解耦
-            data = strategy.get_strategy_market_data(sym)
+            # 新币种走 OKX 策略数据入口(由 strategy.py 负责过滤);
+            # get_market_data 仅用于追踪层, 与新策略解耦
+            data = strategy.get_strategy_market_data(sym, quote_snapshot=quote_snapshot)
+            data['universe_version'] = pool.get('version')
+            data['pool_rank'] = members.get(sym)
             signal = strategy.signal_direction(data)
             candidates.append(data)
             print(f"[{sym}] 确认机会 ({signal}), 等待择优")
@@ -381,39 +476,57 @@ def run_scan():
         except Exception as e:
             print(f"[{sym}] 扫描异常: {e}")
 
-    # 手上有未结案信号 = 用户还在做这一个策略, 不推任何新策略(一次只搞一个)
-    if open_signals(store):
+    available = MAX_OPEN - len(open_signals(store))
+    if available <= 0:
         if candidates:
-            print(f"[*] 有候选机会 {len(candidates)} 个, 但当前有信号在追踪, 不推新策略")
+            print(f"[*] 有候选机会 {len(candidates)} 个, 但并发槽已满, 不推新策略")
     elif candidates:
-        plan, data, attempts = strategy.build_from_candidates(candidates)
+        plans, attempts = strategy.build_plans(candidates, limit=available)
         for sym, reason in attempts:
             print(f"[{sym}] 候选构建计划失败: {reason}")
-        if plan is not None:
+        for plan, data in plans:
             sym = data['symbol']
+            ok, why = slot_available(store, plan['direction'], plan.get('account_risk_pct'))
+            if not ok:
+                print(f"[{sym}] 槽位/风险门禁拒绝: {why}")
+                continue
             try:
-                # 推送前复核: 距离扫描已过若干秒, 用新行情确认信号仍成立、
-                # 现价仍在入场区间; 失效即放弃, 不现场改点位硬推
-                fresh = strategy.get_strategy_market_data(sym)
+                # 推送前复核: 距离扫描已过若干秒, 用新行情确认方向与 15m 触发
+                # 仍成立; 已越过止损/TP1 或偏离过远即放弃, 不现场改点位硬推
+                fresh = strategy.get_strategy_market_data(
+                    sym, quote_snapshot=quote_snapshot)
+                fresh['universe_version'] = pool.get('version')
+                fresh['pool_rank'] = members.get(sym)
                 strategy.ensure_pushable(plan, fresh)
-                # 事件驱动口径: 新策略推送保留, 文案由代码按点位计划格式化;
+                # 事件驱动口径: 文案由代码按点位计划格式化;
                 # AI(Gemini) 只可否决, 不能改点位或解释成立
                 verdict = ai_veto_check(plan, fng)
                 if verdict:
                     print(f"[{sym}] AI 复核否决, 不推: {verdict}")
-                else:
-                    print(f"[{sym}] 择优胜出, 生成计划并推送 TG...")
-                    send_telegram_msg(sym, fresh['price'],
-                                      strategy.format_strategy_text(plan),
-                                      plan['direction'])
-                    # 推送成功才正式建档: 失败时回退, 下次巡检信号仍成立会重试推送
-                    # record_new_signal 按文案里的 做多/做空 判方向, 传规则口径文案
-                    sig = tracker.record_new_signal(
-                        store, fresh,
-                        f"顺势{'做多' if plan['direction'] == 'long' else '做空'}"
-                        f"（4H 趋势确立 + 1H 回踩确认，规则点位）")
-                    sig['strategy'] = strategy.simplify_plan(plan)
-                    store['signals'].append(sig)
+                    continue
+                print(f"[{sym}] 择优胜出, 生成挂单计划并推送 TG...")
+                simplified = strategy.simplify_plan(plan)
+                # 新信号用本轮新闻快照初始化 seen_headlines, 避免刚推送就
+                # 因"全是新头条"而立即复核; 无在持时才补抓一次新闻。
+                if news_snapshot is None:
+                    news_snapshot = fetch_news_headlines()
+                sig = tracker.record_new_signal(
+                    store, fresh,
+                    f"顺势{'做多' if plan['direction'] == 'long' else '做空'}"
+                    f"（4H 趋势 + 1H 回踩 + 15m 触发，规则点位）",
+                    strategy=simplified, seen_headlines=news_snapshot)
+                if not sig:
+                    print(f"[{sym}] 同信号冷却或档案冲突, 跳过本次推送")
+                    continue
+                # 推送成功才正式建档: 失败时回退, 下次巡检信号仍成立会重试推送
+                send_telegram_msg(sym, fresh['price'],
+                                  strategy.format_strategy_text(plan),
+                                  plan['direction'])
+                store['signals'].append(sig)
+                longs = sum(1 for x in open_signals(store) if x['direction'] == 'long')
+                shorts = sum(1 for x in open_signals(store) if x['direction'] == 'short')
+                print(f"[*] 组合快照: 在持 {longs + shorts} 单, 多 {longs} / 空 {shorts}, "
+                      f"总计划风险 {open_risk_pct(store):.2f}%")
             except strategy.StrategyRejected as e:
                 print(f"[{sym}] 推送前复核拒绝: {e}")
             except Exception as e:
@@ -426,7 +539,29 @@ def run_scan():
         except Exception as e:
             print(f"事件通知推送失败: {e}")
 
+    tracker.archive_closed_signals(store)
     tracker.save_signals(store)
+    return {'open': len(open_signals(store)), 'events': len(events)}
+
+
+def run_scan():
+    if not TG_BOT_TOKEN or not TG_CHAT_ID or not GEMINI_API_KEY:
+        raise SystemExit("TG_BOT_TOKEN / TG_CHAT_ID / GEMINI_API_KEY 未设置")
+    try:
+        with single_instance_lock(LOCK_PATH):
+            try:
+                summary = _scan_locked()
+            finally:
+                strategy.flush_klines_cache()
+    except AlreadyRunning as e:
+        print(f"[*] {e}; 本轮跳过")
+        return
+    except Exception as exc:
+        send_heartbeat(False, f"{type(exc).__name__}: {exc}")
+        raise
+    send_heartbeat(True, f"在持 {summary['open']} 单，本轮事件 {summary['events']}"
+                         + ("，标的池不可用" if summary.get('universe') else ""))
+
 
 if __name__ == "__main__":
     run_scan()

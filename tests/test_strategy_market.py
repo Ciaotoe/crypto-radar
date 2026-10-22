@@ -1,4 +1,6 @@
 import copy
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -10,8 +12,9 @@ NOW = 1800000000000 // s.HOUR_MS * s.HOUR_MS + 25 * 60_000
 
 
 def rows(interval, spike=110):
-    hours, count = (4, 800) if interval == "4h" else (1, 300)
-    duration = hours * s.HOUR_MS
+    duration, count = {"4h": (4 * s.HOUR_MS, 800),
+                       "1h": (s.HOUR_MS, 300),
+                       "15m": (s.HOUR_MS // 4, 300)}[interval]
     end = NOW // duration * duration  # 当前未收盘 bar 的开始
     result = []
     for i in range(count):
@@ -43,6 +46,9 @@ def okx_pages(full, params):
 def api(path, params=None):
     if path.endswith("candles"):
         return okx_pages(rows(params["bar"].lower()), params)
+    if path.endswith("tickers"):
+        return [{"instId": "BTC-USDT-SWAP", "ts": str(NOW),
+                 "last": "108", "bidPx": "107.99", "askPx": "108.01"}]
     if path.endswith("ticker"):
         return [{"instId": "BTC-USDT-SWAP", "ts": str(NOW),
                  "last": "108", "bidPx": "107.99", "askPx": "108.01"}]
@@ -64,6 +70,9 @@ def okx_body(path, params=None):
 
 class MarketTests(unittest.TestCase):
     def market(self, custom=api):
+        s.clear_specs_cache()
+        s.clear_klines_cache(remove_file=True)
+        s.clear_candle_rate_limit()
         with patch.object(s, "public_get", side_effect=custom), \
              patch.object(s.time, "time", return_value=NOW / 1000):
             return s.get_strategy_market_data("BTC/USDT")
@@ -198,6 +207,111 @@ class MarketTests(unittest.TestCase):
             get.return_value.raise_for_status.return_value = None
             with self.assertRaisesRegex(s.StrategyRejected, "50011"):
                 s.public_get("/api/v5/market/ticker")
+
+    def test_batch_quote_snapshot_reuses_ticker_mark_and_funding(self):
+        calls = []
+
+        def counted(path, params=None):
+            calls.append((path, params))
+            return api(path, params)
+
+        with patch.object(s, "public_get", side_effect=counted):
+            snapshot = s.load_quote_snapshot()
+            first = s.quote("BTC/USDT", NOW, snapshot)
+            second = s.quote("BTC/USDT", NOW, snapshot)
+        self.assertEqual(sum(p.endswith("/tickers") for p, _ in calls), 1)
+        self.assertEqual(sum(p.endswith("/mark-price") for p, _ in calls), 1)
+        self.assertEqual(sum(p.endswith("/funding-rate") for p, _ in calls), 1)
+        self.assertEqual(first, second)
+
+    def test_4h_cache_skips_refetch_in_same_bar(self):
+        old_path = s.KLINE_CACHE_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            s.KLINE_CACHE_PATH = os.path.join(directory, "klines.json")
+            s.clear_klines_cache(remove_file=True)
+            s.clear_candle_rate_limit()
+            try:
+                calls = []
+
+                def counted(path, params=None):
+                    calls.append((path, params))
+                    return api(path, params)
+
+                with patch.object(s, "public_get", side_effect=counted), \
+                     patch.object(s.time, "time", return_value=NOW / 1000):
+                    s.get_strategy_market_data("BTC/USDT")
+                self.assertEqual(sum(p.endswith("candles") and q.get("bar") == "4H"
+                                     for p, q in calls), 3)
+                s.flush_klines_cache()
+
+                calls.clear()
+                with patch.object(s, "public_get", side_effect=counted), \
+                     patch.object(s.time, "time", return_value=NOW / 1000):
+                    s.get_strategy_market_data("BTC/USDT")
+                self.assertFalse(any(p.endswith("candles") and q.get("bar") == "4H"
+                                     for p, q in calls))
+            finally:
+                s.clear_klines_cache(remove_file=True)
+                s.KLINE_CACHE_PATH = old_path
+                s.clear_klines_cache()
+
+    def test_4h_cache_fetches_one_page_after_new_bar(self):
+        import sys
+        module = sys.modules[__name__]
+        old_path = s.KLINE_CACHE_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            s.KLINE_CACHE_PATH = os.path.join(directory, "klines.json")
+            s.clear_klines_cache(remove_file=True)
+            s.clear_candle_rate_limit()
+            try:
+                with patch.object(s, "public_get", side_effect=api), \
+                     patch.object(s.time, "time", return_value=NOW / 1000):
+                    s.get_strategy_market_data("BTC/USDT")
+                s.flush_klines_cache()
+
+                new_now = NOW + 4 * s.HOUR_MS
+                calls = []
+
+                def counted(path, params=None):
+                    calls.append((path, params))
+                    return api(path, params)
+
+                with patch.object(module, "NOW", new_now), \
+                     patch.object(s, "public_get", side_effect=counted), \
+                     patch.object(s.time, "time", return_value=new_now / 1000):
+                    s.get_strategy_market_data("BTC/USDT")
+                self.assertEqual(sum(p.endswith("candles") and q.get("bar") == "4H"
+                                     for p, q in calls), 1)
+            finally:
+                s.clear_klines_cache(remove_file=True)
+                s.KLINE_CACHE_PATH = old_path
+                s.clear_klines_cache()
+
+    def test_candle_rate_limit_waits_at_40_calls(self):
+        s.clear_candle_rate_limit()
+        try:
+            with patch.object(s.time, "monotonic", return_value=100.0), \
+                 patch.object(s.time, "sleep") as sleep:
+                for _ in range(s.CANDLES_RATE_LIMIT):
+                    s._throttle_candle_call()
+                self.assertFalse(sleep.called)
+                s._throttle_candle_call()
+                self.assertTrue(sleep.called)
+        finally:
+            s.clear_candle_rate_limit()
+
+    def test_candles_request_retries_transient_failure(self):
+        s.clear_candle_rate_limit()
+        try:
+            with patch.object(s, "public_get",
+                              side_effect=[s.requests.HTTPError("503"), []]) as get, \
+                 patch.object(s.time, "sleep") as sleep:
+                self.assertEqual(s._candles_get({"instId": "BTC-USDT-SWAP",
+                                                 "bar": "4H", "limit": 1}), [])
+            self.assertEqual(get.call_count, 2)
+            self.assertTrue(sleep.called)
+        finally:
+            s.clear_candle_rate_limit()
 
 
 if __name__ == "__main__":

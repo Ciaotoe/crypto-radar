@@ -47,6 +47,25 @@ class SignalTests(unittest.TestCase):
         bars.loc[:, ["open", "high", "low", "close", "ema20"]] *= 600
         with clock(): self.assertEqual(s.signal_direction(data), "long")
 
+    def test_15m_trigger_required_for_plan_and_push(self):
+        for side in ("long", "short"):
+            data = market(side)
+            bars = data["bars_15m"]
+            last = len(bars) - 1
+            bars.loc[last, "open"] = bars.loc[last, "close"]
+            with self.subTest(side=side), clock(), \
+                 self.assertRaisesRegex(s.StrategyRejected, "15m"):
+                s.build_plan(data)
+            good = market(side)
+            with clock():
+                plan = s.build_plan(good)
+            bad = market(side)
+            bars = bad["bars_15m"]
+            bars.loc[last, "close"] = bars.loc[last, "open"]
+            with self.subTest(side=side), clock(), \
+                 self.assertRaisesRegex(s.StrategyRejected, "15m"):
+                s.ensure_pushable(plan, bad)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -119,5 +119,85 @@ class TrackerTests(unittest.TestCase):
         self.assertFalse(sig["tp1_hit"])
 
 
+class PendingEntryTests(unittest.TestCase):
+    def pending(self, **extra):
+        signal = base_signal(
+            entry_model="pending", entry_window_min=60, entry_filled_at=None,
+            push_price=100.5, risk_pct=3.96, account_risk_pct=.5, cost_pct_est=.1,
+            stats_eligible=True, entry_ambiguous=False,
+            strategy={"stop": 97.0, "tp1": 103.0, "tp2": 106.0,
+                      "hold_hours": 12, "timeout_action": "平仓观望",
+                      "entry_min": 99.0, "entry_max": 101.0,
+                      "risk_pct": 3.96, "cost_pct_est": .1})
+        signal.update(extra)
+        return signal
+
+    def run_update(self, sig, bars, price=101.0):
+        store = {"signals": [sig]}
+        changed, events = t.update_open_signals(
+            store, lambda s: market_data(price=price), lambda *a: bars)
+        return store["signals"][0], events
+
+    def bars(self, trig, low=100.0, high=102.0, close=101.0, offset_min=10):
+        import pandas as pd
+        ts = int(trig.timestamp() * 1000) + offset_min * 60_000
+        return pd.DataFrame([{"timestamp": ts, "open": 100.5, "high": high,
+                              "low": low, "close": close, "confirmed": True}])
+
+    def test_touch_within_window_fills_at_worst_entry(self):
+        trig = datetime.now(BJ_TZ) - timedelta(minutes=30)
+        sig, events = self.run_update(self.pending(triggered_at=trig.isoformat()),
+                                      self.bars(trig))
+        self.assertEqual(sig["status"], "active")
+        self.assertIsNotNone(sig["entry_filled_at"])
+        self.assertEqual(sig["entry_price"], 101.0)
+        self.assertEqual(sig["mfe"], 0.0)
+        self.assertFalse(sig["entry_ambiguous"])
+        self.assertEqual(events, [])
+
+    def test_no_touch_by_deadline_is_not_entered(self):
+        trig = datetime.now(BJ_TZ) - timedelta(minutes=90)
+        sig, events = self.run_update(
+            self.pending(triggered_at=trig.isoformat()),
+            self.bars(trig, low=102.0, high=103.0, close=102.5, offset_min=70),
+            price=102.5)
+        self.assertEqual(sig["status"], "exited")
+        self.assertEqual(sig["exit_reason"], t.NOT_ENTERED)
+        self.assertFalse(sig["stats_eligible"])
+        self.assertIsNone(sig["pnl_net_pct"])
+        self.assertEqual(events[0]["reason"], t.NOT_ENTERED)
+
+    def test_restart_after_deadline_still_scans_before_expiry(self):
+        trig = datetime.now(BJ_TZ) - timedelta(minutes=90)
+        sig, _ = self.run_update(
+            self.pending(triggered_at=trig.isoformat()),
+            self.bars(trig, low=100.0, offset_min=20), price=101.0)
+        self.assertIsNotNone(sig["entry_filled_at"])
+        self.assertNotEqual(sig["exit_reason"], t.NOT_ENTERED)
+
+    def test_same_bar_entry_and_stop_is_ambiguous_stopped_out(self):
+        trig = datetime.now(BJ_TZ) - timedelta(minutes=30)
+        sig, events = self.run_update(
+            self.pending(triggered_at=trig.isoformat()),
+            self.bars(trig, low=96.0, high=101.0), price=101.0)
+        self.assertEqual(sig["exit_reason"], t.STOPPED_OUT)
+        self.assertTrue(sig["entry_ambiguous"])
+        self.assertEqual(sig["entry_price"], 101.0)
+        self.assertLess(sig["pnl_net_pct"], -3.9)
+        self.assertEqual(events[0]["reason"], t.STOPPED_OUT)
+
+    def test_pending_does_not_accumulate_mfe_before_fill(self):
+        trig = datetime.now(BJ_TZ) - timedelta(minutes=30)
+        import pandas as pd
+        empty = pd.DataFrame(columns=["timestamp", "open", "high", "low",
+                                      "close", "confirmed"])
+        sig, _ = self.run_update(self.pending(triggered_at=trig.isoformat()),
+                                 empty, price=105.0)
+        self.assertEqual(sig["status"], "active")
+        self.assertIsNone(sig["entry_filled_at"])
+        self.assertEqual(sig["mfe"], 0.0)
+        self.assertEqual(sig["pnl_now"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

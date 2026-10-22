@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily crypto-radar backup at 08:00 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 Asia/Shanghai
+AccuracySec=1min
+Persistent=true
+Unit=crypto-radar-backup.service
+
+[Install]
+WantedBy=timers.target

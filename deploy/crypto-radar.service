@@ -1,0 +1,22 @@
+[Unit]
+Description=crypto-radar persistent 15m scanner
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=crypto-radar
+Group=crypto-radar
+WorkingDirectory=/opt/crypto-radar
+EnvironmentFile=/etc/crypto-radar.env
+Environment=TZ=Asia/Shanghai
+Environment=REPO_DIR=/opt/crypto-radar
+ExecStart=/usr/local/sbin/crypto-radar-loop
+Restart=always
+RestartSec=30
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal

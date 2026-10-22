@@ -1,11 +1,16 @@
 """OKX USDT perpetual pullback strategy; public data only, no order execution."""
+import json
 import math
+import os
 import time
+from collections import deque
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
 import pandas as pd
 import pandas_ta as ta
 import requests
+
+from runtime import atomic_write_json
 
 OKX_API = "https://www.okx.com"
 MARKET = "OKX USDT 永续"
@@ -19,6 +24,22 @@ ACCOUNT_RISK = 0.005
 MAX_NOTIONAL_EQUITY = 1.0
 HOLD_HOURS = 24
 MIN_NET_RR = 2.0
+STRATEGY_VERSION = "entry15m-v2"
+SPECS_TTL_MS = 6 * HOUR_MS
+_SPECS_CACHE = {}
+_SPECS_AT_MS = 0
+
+KLINE_CACHE_PATH = os.getenv(
+    "RADAR_KLINES_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "klines_4h.json"))
+KLINE_CACHE_VERSION = 1
+CANDLES_RATE_LIMIT = 40
+CANDLES_RATE_WINDOW_SEC = 2.0
+CANDLES_MAX_RETRIES = 3
+CANDLES_RETRY_SLEEP_SEC = 0.5
+_CANDLES_CALLS = deque()
+_KLINE_CACHE = None
+_KLINE_CACHE_DIRTY = False
 
 
 class StrategyRejected(ValueError):
@@ -54,18 +75,218 @@ def public_get(path, params=None):
     return body["data"]
 
 
-def quote(symbol, now_ms=None):
+def clear_specs_cache():
+    global _SPECS_AT_MS
+    _SPECS_CACHE.clear()
+    _SPECS_AT_MS = 0
+
+
+def clear_klines_cache(remove_file=False):
+    global _KLINE_CACHE, _KLINE_CACHE_DIRTY
+    _KLINE_CACHE = None
+    _KLINE_CACHE_DIRTY = False
+    if remove_file:
+        try:
+            os.remove(KLINE_CACHE_PATH)
+        except OSError:
+            pass
+
+
+def clear_candle_rate_limit():
+    _CANDLES_CALLS.clear()
+
+
+def _load_kline_cache():
+    global _KLINE_CACHE
+    if _KLINE_CACHE is not None:
+        return _KLINE_CACHE
+    _KLINE_CACHE = {}
+    try:
+        with open(KLINE_CACHE_PATH, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("version") == KLINE_CACHE_VERSION \
+           and isinstance(payload.get("symbols"), dict):
+            _KLINE_CACHE = payload["symbols"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return _KLINE_CACHE
+
+
+def flush_klines_cache():
+    global _KLINE_CACHE_DIRTY
+    if not _KLINE_CACHE_DIRTY or _KLINE_CACHE is None:
+        return
+    try:
+        atomic_write_json(KLINE_CACHE_PATH, {
+            "version": KLINE_CACHE_VERSION,
+            "updated_at_ms": int(time.time() * 1000),
+            "symbols": _KLINE_CACHE,
+        })
+        _KLINE_CACHE_DIRTY = False
+    except Exception as exc:
+        print(f"[klines] 4H 缓存落盘失败: {exc}")
+
+
+def _throttle_candle_call():
+    now = time.monotonic()
+    while _CANDLES_CALLS and now - _CANDLES_CALLS[0] >= CANDLES_RATE_WINDOW_SEC:
+        _CANDLES_CALLS.popleft()
+    if len(_CANDLES_CALLS) >= CANDLES_RATE_LIMIT:
+        wait = CANDLES_RATE_WINDOW_SEC - (now - _CANDLES_CALLS[0])
+        if wait > 0:
+            time.sleep(wait)
+        now = time.monotonic()
+        while _CANDLES_CALLS and now - _CANDLES_CALLS[0] >= CANDLES_RATE_WINDOW_SEC:
+            _CANDLES_CALLS.popleft()
+    _CANDLES_CALLS.append(now)
+
+
+def _candles_get(params):
+    last_error = None
+    for attempt in range(CANDLES_MAX_RETRIES + 1):
+        _throttle_candle_call()
+        try:
+            return public_get("/api/v5/market/candles", params)
+        except (requests.RequestException, StrategyRejected) as exc:
+            last_error = exc
+            if attempt < CANDLES_MAX_RETRIES:
+                time.sleep(CANDLES_RETRY_SLEEP_SEC * (2 ** attempt))
+    raise last_error
+
+
+def _expected_4h_close(now_ms):
+    return int(now_ms // (4 * HOUR_MS) * (4 * HOUR_MS))
+
+
+def _merge_candle_rows(*groups, limit=800):
+    by_timestamp = {}
+    for group in groups:
+        for row in group or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 9:
+                continue
+            try:
+                timestamp = float(row[0])
+            except (TypeError, ValueError):
+                continue
+            by_timestamp[timestamp] = list(row)
+    return [by_timestamp[key] for key in sorted(by_timestamp)][-limit:]
+
+
+def _confirmed_rows(rows):
+    return [row for row in rows if len(row) >= 9 and str(row[8]) == "1"]
+
+
+def _fetch_candle_rows(symbol, bar, count):
+    rows, after = [], ""
+    while len(rows) < count:
+        params = {"instId": okx_inst_id(symbol), "bar": bar,
+                  "limit": min(300, count - len(rows))}
+        if after:
+            params["after"] = after
+        batch = _candles_get(params)
+        if not batch:
+            break
+        rows = batch[::-1] + rows
+        after = batch[-1][0]
+    return rows
+
+
+def _load_4h_rows(symbol, now_ms):
+    global _KLINE_CACHE_DIRTY
+    expected = _expected_4h_close(now_ms)
+    cache = _load_kline_cache()
+    entry = cache.get(symbol) if isinstance(cache, dict) else None
+    cached = entry.get("rows") if isinstance(entry, dict) else None
+    cache_valid = isinstance(cached, list) and len(cached) >= 750 \
+        and all(isinstance(row, list) and len(row) >= 9 for row in cached)
+    if cache_valid:
+        try:
+            last_close = int(float(cached[-1][0])) + 4 * HOUR_MS
+            stored_close = int(entry.get("last_close_ms"))
+            cache_valid = stored_close == last_close
+        except (TypeError, ValueError):
+            cache_valid = False
+    if cache_valid and last_close == expected:
+        return cached
+
+    if cache_valid and 0 < expected - last_close <= 300 * 4 * HOUR_MS:
+        try:
+            rows = _merge_candle_rows(cached, _candles_get({
+                "instId": okx_inst_id(symbol), "bar": "4H", "limit": 300}))
+        except Exception:
+            rows = _fetch_candle_rows(symbol, "4H", 800)
+    else:
+        rows = _fetch_candle_rows(symbol, "4H", 800)
+
+    # OKX 在 4H 边界后可能延迟 confirm="1"; 最多再等两拍, 不用旧缓存冒充新 bar。
+    for _ in range(2):
+        confirmed = _confirmed_rows(rows)
+        if confirmed and int(float(confirmed[-1][0])) + 4 * HOUR_MS >= expected:
+            break
+        time.sleep(1)
+        rows = _merge_candle_rows(
+            rows, _candles_get({"instId": okx_inst_id(symbol), "bar": "4H", "limit": 300}))
+
+    confirmed = _confirmed_rows(rows)
+    if confirmed:
+        cache[symbol] = {
+            "last_close_ms": int(float(confirmed[-1][0])) + 4 * HOUR_MS,
+            "rows": confirmed[-800:],
+            "updated_at_ms": now_ms,
+        }
+        _KLINE_CACHE_DIRTY = True
+    return rows
+
+
+def instrument_specs(now_ms=None):
+    global _SPECS_AT_MS
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if _SPECS_CACHE and now_ms - _SPECS_AT_MS < SPECS_TTL_MS:
+        return _SPECS_CACHE
+    rows = public_get("/api/v5/public/instruments", {"instType": "SWAP"})
+    _SPECS_CACHE.clear()
+    for row in rows:
+        if row.get("instId"):
+            _SPECS_CACHE[row["instId"]] = row
+    _SPECS_AT_MS = now_ms
+    return _SPECS_CACHE
+
+
+def load_quote_snapshot():
+    """Fetch one SWAP-wide ticker/mark snapshot; funding stays per symbol."""
+    tickers = {}
+    marks = {}
+    for row in public_get("/api/v5/market/tickers", {"instType": "SWAP"}):
+        if row.get("instId"):
+            tickers[row["instId"]] = row
+    for row in public_get("/api/v5/public/mark-price", {"instType": "SWAP"}):
+        if row.get("instId"):
+            marks[row["instId"]] = row
+    return {"tickers": tickers, "marks": marks, "funding": {}}
+
+
+def quote(symbol, now_ms=None, snapshot=None):
     inst = okx_inst_id(symbol)
-    (ticker,) = public_get("/api/v5/market/ticker", {"instId": inst})
-    (mark,) = public_get("/api/v5/public/mark-price", {"instId": inst, "instType": "SWAP"})
+    if snapshot is None:
+        (ticker,) = public_get("/api/v5/market/ticker", {"instId": inst})
+        (mark,) = public_get("/api/v5/public/mark-price", {"instId": inst, "instType": "SWAP"})
+        funding = public_get("/api/v5/public/funding-rate", {"instId": inst})[0]
+    else:
+        ticker = snapshot["tickers"].get(inst)
+        mark = snapshot["marks"].get(inst)
+        if not ticker or not mark:
+            raise StrategyRejected("批量行情缺少该品种")
+        funding = snapshot["funding"].get(inst)
+        if funding is None:
+            funding = public_get("/api/v5/public/funding-rate", {"instId": inst})[0]
+            snapshot["funding"][inst] = funding
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     for item in (ticker, mark):
         if item.get("instId") != inst:
-            raise StrategyRejected("行情币种不一致")
+            raise StrategyRejected("行情品种不一致")
         timestamp = positive(item.get("ts"), "行情时间")
         if abs(now_ms - timestamp) > MAX_QUOTE_AGE_MS:
-            raise StrategyRejected("永续行情过期或时钟偏差过大")
-    funding = public_get("/api/v5/public/funding-rate", {"instId": inst})[0]
+            raise StrategyRejected("行情数据已过期或时间偏差过大")
     # Missing funding is unknown, never an invented zero.
     try:
         rate = float(funding["fundingRate"])
@@ -77,12 +298,23 @@ def quote(symbol, now_ms=None):
     if ask < bid:
         raise StrategyRejected("买卖报价交叉")
     next_funding = positive(funding.get("nextFundingTime"), "下次资金结算时间")
+    prev_funding = positive(funding.get("prevFundingTime"), "上次资金结算时间")
     if next_funding <= now_ms:
         raise StrategyRejected("资金结算时间已过期")
+    # 结算周期按接口推导, 但防"跳过结算"特例: OKX 费率极低时会跳过某次结算,
+    # 实测 BTC next-prev 可达 16h(2026-10-21 端到端验证发现)。若把 16h 当
+    # 常规周期会低估结算次数和成本; 取观测值与 8h(OKX 常规上限)的较小者,
+    # 宁可多预算一次结算(成本上界是保守方向)。
+    interval_ms = next_funding - prev_funding
+    interval_hours = min(interval_ms / HOUR_MS, 8)
+    # 观测间隔 > 16h = 连跳两次以上, 属数据异常而非常规跳过
+    if interval_hours <= 0 or interval_ms > 16 * HOUR_MS:
+        raise StrategyRejected("资金结算周期与下次结算时间不一致")
     return {"price": positive(ticker.get("last"), "永续最新价"),
             "bid": bid, "ask": ask,
             "mark_price": positive(mark.get("markPx"), "标记价"),
             "funding_rate": rate, "next_funding_ms": next_funding,
+            "prev_funding_ms": prev_funding, "funding_interval_hours": interval_hours,
             "quoted_at_ms": now_ms}
 
 
@@ -90,20 +322,13 @@ def closed_klines(symbol, interval, now_ms):
     """OKX v5 candles 行: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]。
     confirm=="1" 才是已收盘; 最新未收盘 bar 的 OHLC 仍在变化, 永不进信号。
     OKX 单次上限 300 根, 4H EMA200 需 750 根预热, 用 after 游标分页向前翻。"""
-    hours, count = (4, 800) if interval == "4h" else (1, 300)
+    period_ms, count = {"4h": (4 * HOUR_MS, 800), "1h": (HOUR_MS, 300),
+                        "15m": (HOUR_MS // 4, 300)}[interval]
     bar = {"4h": "4H", "1h": "1H", "15m": "15m"}[interval]
-    rows, after = [], ""
-    while len(rows) < count:
-        params = {"instId": okx_inst_id(symbol), "bar": bar,
-                  "limit": min(300, count - len(rows))}
-        if after:
-            params["after"] = after
-        batch = public_get("/api/v5/market/candles", params)
-        if not batch:
-            break
-        # 每页倒序(最新在前): 先翻成本页升序, 再接到已收集的更旧数据前
-        rows = batch[::-1] + rows
-        after = batch[-1][0]
+    if interval == "4h":
+        rows = _load_4h_rows(symbol, now_ms)
+    else:
+        rows = _fetch_candle_rows(symbol, bar, count)
     if not rows:
         raise StrategyRejected("K 线格式不完整")
     df = pd.DataFrame([row[:6] for row in rows], columns=[
@@ -125,7 +350,7 @@ def closed_klines(symbol, interval, now_ms):
        or (df.high < df[["open", "close", "low"]].max(axis=1)).any() \
        or (df.low > df[["open", "close"]].min(axis=1)).any():
         raise StrategyRejected("K 线价格关系异常")
-    duration = hours * HOUR_MS
+    duration = period_ms
     # OKX timestamp 是 K 线开始时间; 收盘 = 开始 + 周期
     if not (df.timestamp.diff().iloc[1:] == duration).all():
         raise StrategyRejected("K 线重复、乱序或缺口")
@@ -135,10 +360,11 @@ def closed_klines(symbol, interval, now_ms):
     return df
 
 
-def get_strategy_market_data(symbol):
+def get_strategy_market_data(symbol, quote_snapshot=None):
     now_ms = int(time.time() * 1000)
     df4 = closed_klines(symbol, "4h", now_ms)
     df1 = closed_klines(symbol, "1h", now_ms)
+    df15 = closed_klines(symbol, "15m", now_ms)
     for length in (20, 50, 200):
         df4[f"ema{length}"] = ta.ema(df4.close, length=length, talib=False)
     adx = ta.adx(df4.high, df4.low, df4.close, length=14, talib=False)
@@ -146,28 +372,16 @@ def get_strategy_market_data(symbol):
     df1["ema20"] = ta.ema(df1.close, length=20, talib=False)
     df1["rsi"] = ta.rsi(df1.close, length=14, talib=False)
     df1["atr"] = ta.atr(df1.high, df1.low, df1.close, length=14, talib=False)
-    specs = public_get("/api/v5/public/instruments", {"instType": "SWAP",
-                                                      "instId": okx_inst_id(symbol)})
-    if not specs:
+    df15["ema20"] = ta.ema(df15.close, length=20, talib=False)
+    inst = instrument_specs(now_ms).get(okx_inst_id(symbol))
+    if not inst:
         raise StrategyRejected("品种不是正在交易的 USDT 永续")
-    inst = specs[0]
     # linear U 本位: ctType=linear 且以 USDT 结算; state=live 才可交易
     if inst.get("state") != "live" or inst.get("ctType") != "linear" \
        or inst.get("settleCcy") != "USDT":
         raise StrategyRejected("品种不是正在交易的 USDT 永续")
-    q = quote(symbol)
-    # 结算周期按接口推导, 但防"跳过结算"特例: OKX 费率极低时会跳过某次结算,
-    # 实测 BTC next-prev 可达 16h(2026-10-21 端到端验证发现)。若把 16h 当
-    # 常规周期会低估结算次数和成本; 取观测值与 8h(OKX 常规上限)的较小者,
-    # 宁可多预算一次结算(成本上界是保守方向)。
-    funding = public_get("/api/v5/public/funding-rate", {"instId": okx_inst_id(symbol)})[0]
-    interval_ms = positive(funding.get("nextFundingTime"), "下次结算") \
-        - positive(funding.get("prevFundingTime"), "上次结算")
-    interval_hours = min(interval_ms / HOUR_MS, 8)
-    # 观测间隔 > 16h = 连跳两次以上, 属数据异常而非常规跳过
-    if interval_hours <= 0 or interval_ms > 16 * HOUR_MS:
-        raise StrategyRejected("资金结算周期与下次结算时间不一致")
-    c4, c1 = df4.iloc[-1], df1.iloc[-1]
+    q = quote(symbol, now_ms, quote_snapshot)
+    c4, c1, c15 = df4.iloc[-1], df1.iloc[-1], df15.iloc[-1]
     # OKX 合约是张数模式: qty 单位是"张", 1 张 = ctVal 个币(BTC 1张=0.01 BTC)。
     # 最小名义金额无直接字段, 按 最小张数*面值*现价 推导。
     ctval = positive(inst.get("ctVal"), "合约面值")
@@ -178,15 +392,19 @@ def get_strategy_market_data(symbol):
             "4h_di_minus": float(c4.di_minus), "4h_close": float(c4.close),
             "1h_rsi": float(c1.rsi), "1h_atr": float(c1.atr),
             "1h_ema20": float(c1.ema20), "bars_1h": df1, "bars_4h": df4,
+            "15m_ema20": float(c15.ema20), "15m_close": float(c15.close),
+            "15m_open": float(c15.open), "bars_15m": df15,
             "signal_close_ms": int(c1.close_time),
-            "funding_interval_hours": interval_hours,
+            "signal_close_ms_15m": int(c15.close_time),
+            "funding_interval_hours": q["funding_interval_hours"],
             "tick_size": positive(inst.get("tickSz"), "价格步长"),
             "qty_step": positive(inst.get("lotSz"), "数量步长"),
             "min_qty": positive(inst.get("minSz"), "最小数量"),
             "max_qty": positive(inst.get("maxMktSz"), "最大下单量"),
             "min_notional": positive(inst.get("minSz"), "最小张数") * ctval * q["price"]}
     if not all(math.isfinite(data[k]) for k in ["4h_ema20", "4h_ema50", "4h_ema200",
-                    "4h_ema20_prev", "4h_adx", "4h_di_plus", "4h_di_minus", "1h_rsi", "1h_atr", "1h_ema20"]):
+                    "4h_ema20_prev", "4h_adx", "4h_di_plus", "4h_di_minus", "1h_rsi", "1h_atr",
+                    "1h_ema20", "15m_ema20", "15m_close", "15m_open"]):
         raise StrategyRejected("指标不完整")
     return data
 
@@ -241,6 +459,23 @@ def signal_direction(data, now_ms=None):
        or sign * (price - prev.close) <= 0:
         raise StrategyRejected("现价偏离确认区间或重新失守，放弃追价")
     return direction
+
+
+def trigger_15m(data, direction):
+    bars = data.get("bars_15m")
+    if bars is None or len(bars) < 25:
+        raise StrategyRejected("15m 触发样本不足")
+    bar = bars.iloc[-1]
+    ema = float(bar["ema20"]) if "ema20" in bars.columns else positive(data.get("15m_ema20"), "15M EMA20")
+    close, opening = positive(bar["close"], "15M 收盘"), positive(bar["open"], "15M 开盘")
+    ema = positive(ema, "15M EMA20")
+    if direction == "long":
+        confirmed = close > opening and close > ema
+    else:
+        confirmed = close < opening and close < ema
+    if not confirmed:
+        raise StrategyRejected("15m 未出现同向收盘触发确认")
+    return True
 
 
 def round_tick(price, tick, up=False):
@@ -351,12 +586,12 @@ def build_plan(data, direction=None):
     if direction is not None and direction != confirmed:
         raise StrategyRejected("点位方向与确认信号不一致")
     direction = confirmed
+    trigger_15m(data, direction)
     sign = 1 if direction == "long" else -1
     atr, tick = data["1h_atr"], data["tick_size"]
     entry = data["ask"] if direction == "long" else data["bid"]
     if data["ask"] - data["bid"] > .1 * atr or abs(data["mark_price"]-data["price"]) > .25 * atr:
         raise StrategyRejected("买卖价差或标记价偏离过大")
-    # This is an immediate-entry setup, not an unconfirmed future limit order.
     lower = round_tick(entry - .1 * atr, tick, up=True)
     upper = round_tick(entry + .1 * atr, tick)
     if lower > upper or abs(entry-data["price"]) > .1 * atr:
@@ -369,7 +604,8 @@ def build_plan(data, direction=None):
     risk = abs(worst-stop)
     if risk > 3 * atr + 1e-9 or risk / worst > .03:
         raise StrategyRejected("止损须不超过 3 ATR 及价格的 3%")
-    loss = risk + cost_per_unit(data, worst, stop, direction)
+    stop_cost = cost_per_unit(data, worst, stop, direction)
+    loss = risk + stop_cost
     rate = max(data["funding_rate"] * sign, 0) * (math.ceil(HOLD_HOURS/data["funding_interval_hours"])+1)
     targets = []
     for rr in (2., 3.):
@@ -383,11 +619,15 @@ def build_plan(data, direction=None):
             "stop": stop, "tp1": targets[0], "tp2": targets[1],
             "structure_boundary": boundary, "hold_hours": HOLD_HOURS,
             "timeout_action": "人工复核剩余仓位，信号走弱则退出；不因横盘扩大止损",
+            "entry_model": "pending", "entry_window_min": 60,
             "signal_close_ms": data["signal_close_ms"], "created_at_ms": int(time.time()*1000),
             "market": MARKET, "stop_trigger": "标记价格(MARK_PRICE)",
             "account_risk_pct": ACCOUNT_RISK * 100,
             **{key: data[key] for key in ["qty_step", "min_qty", "max_qty", "min_notional", "ct_val"]}}
     plan.update(validate_plan(plan, data))
+    plan.update({"risk_pct": risk / worst * 100,
+                 "cost_pct_est": stop_cost / worst * 100,
+                 "strategy_version": STRATEGY_VERSION})
     return plan
 
 
@@ -401,27 +641,46 @@ def candidate_score(data):
     return positive(data["4h_adx"], "ADX"), -abs(price - ema) / atr
 
 
-def build_from_candidates(candidates):
-    """按可比指标择优逐个构建点位计划; 首选被拒不阻断其余合格候选。
-    返回 (plan, data, attempts); 全部不合格时 plan 为 None,
-    attempts 收集每个候选的拒绝原因, 供日志与只读检查输出。"""
-    attempts = []
+def build_plans(candidates, limit=1):
+    """按可比指标择优逐个构建点位计划; 首选被拒不阻断其余合格候选。"""
+    attempts, plans = [], []
     for data in sorted(candidates, key=candidate_score, reverse=True):
+        if len(plans) >= limit:
+            break
         try:
-            return build_plan(data), data, attempts
+            plans.append((build_plan(data), data))
         except StrategyRejected as exc:
             attempts.append((data["symbol"], str(exc)))
+    return plans, attempts
+
+
+def build_from_candidates(candidates):
+    """返回 (plan, data, attempts); 全部不合格时 plan 为 None。"""
+    plans, attempts = build_plans(candidates)
+    if plans:
+        plan, data = plans[0]
+        return plan, data, attempts
     return None, None, attempts
 
 
 def ensure_pushable(plan, fresh):
-    """推送前复核: 用推送时刻的新行情重新确认信号仍成立、现价仍在计划
-    入场区间内。任一不满足即拒绝本轮推送 —— 计划失效就放弃, 不现场改点位。"""
+    """推送前复核: 用推送时刻的新行情重新确认方向与 15m 触发仍成立;
+    现价可在入场带外等待回踩, 但已越过止损/TP1 或偏离过远则本轮放弃。"""
     if signal_direction(fresh) != plan["direction"]:
         raise StrategyRejected("确认方向已改变，计划失效")
+    trigger_15m(fresh, plan["direction"])
     price = positive(fresh["price"], "现价")
-    if not plan["entry_min"] <= price <= plan["entry_max"]:
-        raise StrategyRejected("现价已离开计划入场区间，本轮放弃推送")
+    atr = positive(fresh.get("1h_atr"), "ATR")
+    sign = 1 if plan["direction"] == "long" else -1
+    stop = positive(plan.get("stop"), "止损")
+    tp1 = positive(plan.get("tp1"), "TP1")
+    if sign * (price - stop) <= 0:
+        raise StrategyRejected("现价已越过止损，计划失效")
+    if sign * (price - tp1) >= 0:
+        raise StrategyRejected("现价已越过 TP1，计划失效")
+    edge = plan["entry_max"] if sign > 0 else plan["entry_min"]
+    if sign * (price - edge) > atr:
+        raise StrategyRejected("现价已远离入场区间，放弃追价")
     return fresh
 
 
@@ -435,15 +694,15 @@ def format_strategy_text(plan):
     return (
         f"【方向】：{d}\n"
         f"【建议入场】：{plan['entry_min']:.2f} – {plan['entry_max']:.2f}"
-        f"（现价即时入场，超出区间不追）\n"
+        f"（60 分钟内挂单等回踩；未成交则失效，不追价）\n"
         f"【硬止损位】：{plan['stop']:.2f}（最不利入场约亏 {stop_pct:.1f}%）\n"
         f"【分批止盈】：TP1 {plan['tp1']:.2f} / TP2 {plan['tp2']:.2f}"
         f"（TP1 到位可减仓保本）\n"
         f"【时间预期】：{plan['hold_hours']:.0f} 小时内应脱离成本区；"
         f"超时则{plan['timeout_action']}\n"
         f"【核心逻辑】：4H 趋势排列与动能一致，1H 回踩均线后出现同向收盘"
-        f"反转确认；止损置于近端结构之外，目标按净盈亏比 2R/3R 预设，"
-        f"前方已确认结构边界 {plan['structure_boundary']:.2f}。"
+        f"反转，且最新已收盘 15m 同向站上 EMA20；止损置于近端结构之外，"
+        f"目标按净盈亏比 2R/3R 预设，前方已确认结构边界 {plan['structure_boundary']:.2f}。"
         f"单笔风险不超过账户权益的 {plan['account_risk_pct']:.1f}%。"
     )
 
@@ -457,4 +716,10 @@ def simplify_plan(plan):
             "entry_min": plan["entry_min"], "entry_max": plan["entry_max"],
             "net_rr": plan["net_rr"],
             "account_risk_pct": plan["account_risk_pct"],
+            "entry_model": plan.get("entry_model", "pending"),
+            "entry_window_min": plan.get("entry_window_min", 60),
+            "risk_pct": plan.get("risk_pct"),
+            "cost_pct_est": plan.get("cost_pct_est"),
+            "signal_close_ms": plan.get("signal_close_ms"),
+            "strategy_version": plan.get("strategy_version", STRATEGY_VERSION),
             "text": format_strategy_text(plan)}

@@ -8,6 +8,8 @@ __pycache__/
 
 # cron 运行日志
 cron.log
+data/radar.lock
+data/klines_4h.json
 
 # uv.lock 需要提交, 保证依赖可复现
 .claude/
