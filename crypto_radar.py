@@ -20,6 +20,7 @@ TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 HEARTBEAT_ENABLED = os.getenv("RADAR_HEARTBEAT", "0") == "1"
+QUOTE_SNAPSHOT_TTL_S = float(os.getenv("RADAR_QUOTE_SNAPSHOT_TTL_S", "60"))
 
 # 2026-10-21 整体迁移 OKX: 新策略(strategy.py)与追踪层(本文件)同源,
 # 单一 OKX 数据源无回退 —— 回退币安会重新引入跨市场基差错位
@@ -430,6 +431,24 @@ def slot_available(store, direction, risk_pct):
     return True, ""
 
 
+def _maybe_refresh_quote_snapshot(snapshot, loaded_at, now=None):
+    """批量报价快照只覆盖扫描起点; 冷缓存轮耗时可能超过报价有效期,
+    按 TTL 主动续取, 避免池尾标的被误判为行情过期。刷新失败沿用旧快照,
+    并按当前时间退避, 不逐币重试。"""
+    now = time.time() if now is None else now
+    if now - loaded_at < QUOTE_SNAPSHOT_TTL_S:
+        return snapshot, loaded_at
+    try:
+        fresh = strategy.load_quote_snapshot()
+    except Exception as e:
+        print(f"[*] 行情快照刷新失败，沿用旧快照: {e}")
+        return snapshot, now
+    if snapshot:
+        # 资金费率单轮内不变, 复用已取结果, 避免刷新后逐币重取
+        fresh['funding'] = dict(snapshot.get('funding') or {})
+    return fresh, now
+
+
 def _scan_locked():
     # 先更新历史信号档案: 结案/预警事件攒起来最后合并推一条
     store = tracker.load_signals()
@@ -460,9 +479,12 @@ def _scan_locked():
         quote_snapshot = strategy.load_quote_snapshot()
     except Exception as e:
         print(f"[*] 批量行情获取失败，回退逐币行情: {e}")
+    quote_snapshot_at = time.time()
     candidates = []
     for sym in symbols:
         try:
+            quote_snapshot, quote_snapshot_at = _maybe_refresh_quote_snapshot(
+                quote_snapshot, quote_snapshot_at)
             # 新币种走 OKX 策略数据入口(由 strategy.py 负责过滤);
             # get_market_data 仅用于追踪层, 与新策略解耦
             data = strategy.get_strategy_market_data(sym, quote_snapshot=quote_snapshot)
@@ -493,6 +515,8 @@ def _scan_locked():
             try:
                 # 推送前复核: 距离扫描已过若干秒, 用新行情确认方向与 15m 触发
                 # 仍成立; 已越过止损/TP1 或偏离过远即放弃, 不现场改点位硬推
+                quote_snapshot, quote_snapshot_at = _maybe_refresh_quote_snapshot(
+                    quote_snapshot, quote_snapshot_at)
                 fresh = strategy.get_strategy_market_data(
                     sym, quote_snapshot=quote_snapshot)
                 fresh['universe_version'] = pool.get('version')
