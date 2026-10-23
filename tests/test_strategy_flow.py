@@ -30,10 +30,12 @@ class FlowTests(unittest.TestCase):
             plan = s.build_plan(data)
         return data, plan
 
-    def run_scan_with(self, store, market_data, veto=None, events=None):
+    def run_scan_with(self, store, market_data, veto=None, events=None,
+                      snapshots=None):
         """跑一遍 run_scan: 隔离档案读写、事件更新与真实网络调用。
         market_data: get_strategy_market_data 的 side_effect 序列
-        (3 币种扫描 + 推送前复核), veto: ai_veto_check 返回值。"""
+        (3 币种扫描 + 推送前复核), veto: ai_veto_check 返回值。
+        snapshots: load_quote_snapshot 的返回值序列, 默认 None(逐币回退)。"""
         events = events or []
         universe = {"version": "u-test",
                     "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
@@ -47,7 +49,8 @@ class FlowTests(unittest.TestCase):
              patch.object(radar, "review_signals_with_ai"), \
              patch.object(radar.tracker, "update_open_signals",
                           return_value=(False, events)), \
-             patch.object(radar.strategy, "load_quote_snapshot", return_value=None), \
+             patch.object(radar.strategy, "load_quote_snapshot",
+                          return_value=None, side_effect=snapshots), \
              patch.object(radar.strategy, "get_strategy_market_data",
                           side_effect=market_data):
             radar.run_scan()
@@ -173,6 +176,57 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(radar.slot_available(store, "short", .5)[0])
         store["signals"].append(held("short", .5))
         self.assertFalse(radar.slot_available(store, "short", .5)[0])
+
+    def test_quote_snapshot_refreshes_after_ttl_and_reuses_funding(self):
+        old = {"tickers": {}, "marks": {},
+               "funding": {"BTC-USDT-SWAP": {"fundingRate": "0.01"}}}
+        new = {"tickers": {}, "marks": {}, "funding": {}}
+        with patch.object(radar, "QUOTE_SNAPSHOT_TTL_S", 60), \
+             patch.object(radar.strategy, "load_quote_snapshot",
+                          return_value=new):
+            same, at = radar._maybe_refresh_quote_snapshot(old, 1000., now=1059.)
+            self.assertIs(same, old)
+            self.assertEqual(at, 1000.)
+            refreshed, at = radar._maybe_refresh_quote_snapshot(old, 1000., now=1060.)
+            self.assertIs(refreshed, new)
+            self.assertEqual(at, 1060.)
+            self.assertEqual(refreshed["funding"], old["funding"])
+
+    def test_quote_snapshot_refresh_failure_backs_off(self):
+        old = {"tickers": {}, "marks": {}, "funding": {}}
+        with patch.object(radar, "QUOTE_SNAPSHOT_TTL_S", 60), \
+             patch.object(radar.strategy, "load_quote_snapshot",
+                          side_effect=RuntimeError("down")) as load:
+            same, at = radar._maybe_refresh_quote_snapshot(old, 1000., now=1060.)
+            self.assertIs(same, old)
+            self.assertEqual(at, 1060.)
+            again, at = radar._maybe_refresh_quote_snapshot(old, at, now=1119.)
+            self.assertIs(again, old)
+            self.assertEqual(at, 1060.)
+        load.assert_called_once()
+
+    def test_scan_refreshes_snapshot_before_late_symbols_and_fresh_check(self):
+        data, plan = self.make()
+        fresh = {**data, "price": plan["entry"]}
+        snapshots = [{"tickers": {}, "marks": {}, "funding": {}}
+                     for _ in range(5)]
+        seen = []
+
+        def market_data(symbol, quote_snapshot=None):
+            seen.append(quote_snapshot)
+            if len(seen) == 4:
+                return fresh
+            if symbol == "BTC/USDT":
+                return data
+            raise s.StrategyRejected("x")
+
+        with patch.object(radar, "QUOTE_SNAPSHOT_TTL_S", 0):
+            send = self.run_scan_with(
+                {"signals": []}, market_data, snapshots=snapshots)[0]
+        self.assertTrue(send.called)
+        self.assertEqual(len(seen), 4)
+        for index, snapshot in enumerate(seen):
+            self.assertIs(snapshot, snapshots[index + 1])
 
     def test_veto_failure_allows_push(self):
         data, plan = self.make()
