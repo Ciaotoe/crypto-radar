@@ -24,6 +24,18 @@ ACCOUNT_RISK = 0.005
 MAX_NOTIONAL_EQUITY = 1.0
 HOLD_HOURS = 24
 MIN_NET_RR = 2.0
+# 2026-10-24 第四轮: 筛选阈值提为具名常量, backtest.py 直接 import 同一份,
+# 避免"回放口径"与"生产口径"两套字面量漂移。默认值与改造前逐字相同,
+# 本轮不调参 —— 提常量只是为了让阈值可被扫描衡量, 不是重新标定。
+ADX_FLOOR = 22.0            # 4H 趋势动能下限
+RSI_LONG_BAND = (40.0, 65.0)
+RSI_SHORT_BAND = (35.0, 60.0)
+REVERSAL_CLOSE_POS = 0.65   # 反转 K 线收盘在振幅中的位置
+DEV_1H_ATR = 1.5            # 现价距 1H EMA20 上限
+DEV_4H_ATR = 2.0            # 现价距 4H EMA20 上限
+STOP_MIN_ATR = 1.5          # 止损下限(防噪声止损)
+STOP_MAX_ATR = 3.0          # 止损上限(防宽止损稀释仓位)
+STOP_MAX_PCT = 0.03         # 止损不得超过价格的 3%
 # 2026-10-24 第四轮: 突出度过滤与目标上限语义。3 根 K 线局部极值本身匹配 1H 噪声
 # (实测最近枢轴中位 +0.19 ATR/突出度 0.19 ATR), 旧规则要求它位于 TP2(中位 6 ATR)
 # 之后 —— 几何上不可能, 6 币种 170 天重放 0/153 通过, 等于关闭策略。
@@ -429,7 +441,7 @@ def signal_direction(data, now_ms=None):
     atr = positive(data.get("1h_atr"), "ATR")
     price = positive(data.get("price"), "现价")
     e20, e50, e200 = (positive(data.get(f"4h_ema{x}"), f"EMA{x}") for x in (20, 50, 200))
-    if data["4h_adx"] < 22:
+    if data["4h_adx"] < ADX_FLOOR:
         raise StrategyRejected("4H ADX 低于趋势筛选阈值")
     if e20 > e50 > e200 and data["4h_ema20_prev"] < e20 \
        and data["4h_close"] > e20 and data["4h_di_plus"] > data["4h_di_minus"]:
@@ -445,13 +457,13 @@ def signal_direction(data, now_ms=None):
         raise StrategyRejected("回踩确认样本不足或无有效振幅")
     rsi = data["1h_rsi"]
     if direction == "long":
-        rsi_ok = 40 <= rsi <= 65 and rsi > prev.rsi
+        rsi_ok = RSI_LONG_BAND[0] <= rsi <= RSI_LONG_BAND[1] and rsi > prev.rsi
         reversal = current.close > current.open and current.close > prev.high \
-                   and (current.close - current.low) / (current.high - current.low) >= .65
+                   and (current.close - current.low) / (current.high - current.low) >= REVERSAL_CLOSE_POS
     else:
-        rsi_ok = 35 <= rsi <= 60 and rsi < prev.rsi
+        rsi_ok = RSI_SHORT_BAND[0] <= rsi <= RSI_SHORT_BAND[1] and rsi < prev.rsi
         reversal = current.close < current.open and current.close < prev.low \
-                   and (current.high - current.close) / (current.high - current.low) >= .65
+                   and (current.high - current.close) / (current.high - current.low) >= REVERSAL_CLOSE_POS
     if not rsi_ok or not reversal:
         raise StrategyRejected("1H 未出现方向一致的收盘反转确认")
     touched = False
@@ -461,7 +473,7 @@ def signal_direction(data, now_ms=None):
                 touched = True
     if not touched or sign * (current.close - data["1h_ema20"]) <= 0:
         raise StrategyRejected("没有均线回踩/反弹后收回的证据")
-    if abs(price - data["1h_ema20"]) > 1.5 * atr or abs(price - e20) > 2 * atr \
+    if abs(price - data["1h_ema20"]) > DEV_1H_ATR * atr or abs(price - e20) > DEV_4H_ATR * atr \
        or abs(price - current.close) > .5 * atr \
        or sign * (price - data["1h_ema20"]) <= 0 \
        or sign * (price - prev.close) <= 0:
@@ -592,7 +604,8 @@ def validate_plan(plan, data):
         raise StrategyRejected("点位方向、结构外止损或目标空间不合格")
     risk = abs(worst - values["stop"])
     minrisk = min(abs(low-values["stop"]), abs(high-values["stop"]))
-    if minrisk < 1.5 * atr - 1e-9 or risk > 3 * atr + 1e-9 or risk / worst > .03:
+    if minrisk < STOP_MIN_ATR * atr - 1e-9 or risk > STOP_MAX_ATR * atr + 1e-9 \
+       or risk / worst > STOP_MAX_PCT:
         raise StrategyRejected("止损须至少 1.5 ATR、至多 3 ATR，且不超过价格的 3%")
     loss = risk + cost_per_unit(data, worst, values["stop"], side, values["hold_hours"])
     reward = abs(values["tp1"]-worst) - cost_per_unit(data, worst, values["tp1"], side, values["hold_hours"])
@@ -635,7 +648,7 @@ def build_plan(data, direction=None):
     stop = round_tick(stop, tick, up=direction == "short")
     boundary = structure_boundary(data, direction, worst)
     risk = abs(worst-stop)
-    if risk > 3 * atr + 1e-9 or risk / worst > .03:
+    if risk > STOP_MAX_ATR * atr + 1e-9 or risk / worst > STOP_MAX_PCT:
         raise StrategyRejected("止损须不超过 3 ATR 及价格的 3%")
     stop_cost = cost_per_unit(data, worst, stop, direction)
     loss = risk + stop_cost
@@ -646,11 +659,16 @@ def build_plan(data, direction=None):
         desired = (rr*loss + worst*(2*(TAKER_FEE+SLIPPAGE)+rate)) / (1-sign*(TAKER_FEE+SLIPPAGE))
         targets.append(round_tick(worst + sign*desired, tick, up=direction == "long"))
     if boundary is not None:
-        # 目标是显著阻力前的一段可达空间, 不是固定 3R。boundary=None 即开阔空间,
-        # 按固定 R 目标放行(旧代码在这里 raise, 是零信号的直接来源)。
+        # 显著结构是目标上限, 不是一票否决(旧代码要求它落在固定 3R 之后 =
+        # 结构性不可能, 是零信号的直接来源)。TP1 保住净 2R 下限; TP2 收回
+        # 结构前的可达空间, 到达前不留"越阻力才止盈"的幻想。
         reachable = abs(boundary - worst) * BOUNDARY_CAP_FRAC
-        if sign * (targets[1] - worst) > reachable + 1e-9:
-            raise StrategyRejected("已知支撑/阻力前的空间不足以容纳净 3R 目标")
+        if sign * (targets[0] - worst) > reachable + 1e-9:
+            raise StrategyRejected("显著结构前的空间不足以容纳净 2R 目标 TP1")
+        capped = round_tick(worst + sign * reachable, tick, up=direction == "short")
+        if sign * (capped - targets[0]) <= 1e-9:
+            raise StrategyRejected("可达空间不足以在 TP1 之外再设 TP2")
+        targets[1] = capped
     plan = {"symbol": data["symbol"], "direction": direction, "entry": entry,
             "entry_min": lower, "entry_max": upper,
             "stop": stop, "tp1": targets[0], "tp2": targets[1],
