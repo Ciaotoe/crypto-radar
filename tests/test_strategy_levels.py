@@ -39,20 +39,30 @@ class LevelTests(unittest.TestCase):
             s.build_plan(data)
 
     def test_noise_pivots_do_not_form_boundary(self):
-        """3 根 K 线局部极值本身匹配噪声; 突出度不足 MIN_PROMINENCE_ATR*ATR
-        的枢轴不得构成边界(否则旧 bug 复现: 边界总在 TP2 之前)。"""
+        """入场前方的微小凸起(突出度 < MIN_PROMINENCE_ATR*ATR)不得构成边界。
+
+        本例必须双向断言才有意义: 枢轴 101.2 在入场 101.1 前方 0.1 ATR、突出度
+        0.8 ATR。阈值 1.0 时视为噪声(None), 阈值 0 时旧语义会把它当阻力(101.2)
+        —— 正是"边界总在 TP2 之前"那个 bug。只断言 None 而不对照旧语义, 测试
+        会在枢轴位于入场之后时假通过(独立复核 2026-10-24 抓到过这个缺陷)。
+        """
         data = market()
         for frame in (data["bars_1h"], data["bars_4h"]):
             frame.loc[frame.high > 105, "high"] = 100.4
-        # 前方 0.3 ATR 处的微小凸起: 不是结构
-        data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 100.7
-        self.assertIsNone(s.structure_boundary(data, "long", 101.1))
+        data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 101.2
+        saved = s.MIN_PROMINENCE_ATR
+        try:
+            s.MIN_PROMINENCE_ATR = 1.0
+            self.assertIsNone(s.structure_boundary(data, "long", 101.1))
+            s.MIN_PROMINENCE_ATR = 0.0  # 旧语义对照: 同一枢轴会被当成阻力
+            self.assertAlmostEqual(s.structure_boundary(data, "long", 101.1), 101.2)
+        finally:
+            s.MIN_PROMINENCE_ATR = saved
         with clock():
             self.assertIsNone(s.build_plan(data)["structure_boundary"])
-        # 同样的凸起若突出 3 ATR 就是真结构
+        # 同样位置的凸起若突出 3 ATR 就是真结构
         data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 103.4
-        self.assertAlmostEqual(
-            s.structure_boundary(data, "long", 101.1), 103.4)
+        self.assertAlmostEqual(s.structure_boundary(data, "long", 101.1), 103.4)
 
     def test_tp2_is_min_of_fixed_3r_and_reachable(self):
         """TP2 = min(净 3R, 结构前可达空间)。结构够远时必须保留净 3R,
