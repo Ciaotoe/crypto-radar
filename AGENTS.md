@@ -7,6 +7,7 @@
 - `strategy.py` 是新策略的独立数据入口与规则层：行情拉取、信号确认、点位/成本/仓位全部由代码生成，**AI（Gemini）只可否决，不生成点位、不解释成立**；复核调用失败放行，推送不得依赖单一外部模型。
 - `crypto_radar.py` 中 `get_market_data` / `fetch_klines_since` / `review_signals_with_ai` / 巡检循环属于追踪层，与新策略解耦，改新策略时不得触碰追踪状态机口径。`universe.py` 只负责动态标的池；`report.py` 只读统计，不得写 `signals.json`。
 - 点位契约（signals.json 档案的 strategy 字段：stop/tp1/tp2/hold_hours/timeout_action/entry_min/entry_max/net_rr/risk_pct/cost_pct_est/signal_close_ms/strategy_version/text）如需变更，先列迁移与兼容范围并征得确认。
+- 结构边界口径（2026-10-24 第四轮确立）：`structure_boundary` 只认显著结构 —— 3 根 K 线局部极值须比邻居突出 `RADAR_MIN_PROMINENCE_ATR`×ATR（默认 1.0），否则视为 1H 噪声丢弃；已移除旧的"24h 极值"兜底项。**该字段可为 `null`（前方无显著结构 = 开阔空间），消费方不得假设是正数**；`format_strategy_text` 已分支渲染。显著结构是**目标上限而非否决门**：TP2 = `min(净 3R, 可达空间 × RADAR_BOUNDARY_CAP_FRAC)`（默认 0.85），仅当连净 2R 的 TP1 都容不下才拒绝。改这两条前先跑 `backtest.py` 看漏斗，不要凭直觉收紧。
 - 入场契约（2026-10-22 起）：新信号 `entry_model=pending`，`triggered_at + entry_window_min(60)` 内只认已收盘 15m 触带成交；成交后 `entry_price` 取最不利入场价，`push_price` 保留推送时价格；未成交记 `exit_reason=not_entered`、`stats_eligible=false`。旧档案迁移为 `entry_model=immediate`、`entry_filled_at=triggered_at`，行为不变。
 
 ## 已知环境约束
@@ -23,4 +24,7 @@
 - 策略测试：`uv run --no-sync python -m unittest discover -s tests -p 'test_strategy*.py' -v`
 - 全量测试：`uv run --no-sync python -m unittest discover -s tests -p 'test_*.py' -v`
 - 净口径报表：`uv run --no-sync python report.py --json`（只读，不发网络请求）
+- 判定栈重放：`uv run --no-sync python backtest.py --snapshot tests/fixtures/doge_1h.json.gz`（离线只读，约 1.3s）；联网口径 `--symbols ... --days ...`。**改任何筛选阈值或点位规则后必须跑一次看漏斗**，`PASSED=0` 即门槛在真实数据上不可触发。
 - 测试需要冻结 `strategy.time.time`（行情新鲜度校验依赖真实时钟，fixture 行情是固定时间戳）；`crypto_radar` 模块级读取密钥环境变量，测试 patch 模块属性而非 `os.environ`。
+- **手工构造的行情 fixture 只能覆盖单点几何，不能用来判断门槛是否可触发**：`strategy_fixtures.market()` 把阻力植入 9–11 ATR 外（真实显著结构中位仅 1.6 ATR 外），曾使 74 个测试全绿而生产零信号。这类保证由 `tests/test_backtest.py` + 录制快照承担；新增"门槛能出信号"类断言一律走快照，不要往 `strategy_fixtures.py` 里加手工开阔空间。
+- 筛选阈值（ADX 下限、RSI 带、反转收盘位、偏离倍数、止损 ATR/百分比上下限）是 `strategy.py` 的具名模块常量，`backtest.py` 运行时读取同一份，不得在回放侧重定义字面量。

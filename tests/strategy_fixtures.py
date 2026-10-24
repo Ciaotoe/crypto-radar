@@ -21,6 +21,10 @@ def market(direction="long"):
     bars.loc[len(bars)-2, ["open", "high", "low", "close", "ema20", "rsi"]] = [100.2, 100.3, 99.5, 99.9, 100., 46.]
     bars.loc[len(bars)-1, ["open", "high", "low", "close", "ema20", "rsi"]] = [99.9, 101.2, 99.7, 101., 100., 52.]
     # Historical resistance, confirmed before the entry setup.
+    # 注意: 本 fixture 只覆盖"结构远离入场"(9-11 ATR)这一档 —— 该档下 TP2
+    # 保持净 3R, 是点位数学单测需要的稳定基线。它**不代表真实枢轴密度**
+    # (实测显著结构中位仅 1.6 ATR 外), 因此不能用它判断门槛是否可触发。
+    # "门槛在真实数据上非空"由 tests/test_backtest.py 用录制快照保证。
     bars.loc[170, ["high", "open", "close"]] = [112., 100., 100.]
     bars.loc[200, ["high", "open", "close"]] = [110., 100., 100.]
     data["bars_4h"].loc[:, ["open", "high", "low", "close"]] = [100., 100.4, 99.5, 100.]
