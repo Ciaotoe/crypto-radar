@@ -24,7 +24,15 @@ ACCOUNT_RISK = 0.005
 MAX_NOTIONAL_EQUITY = 1.0
 HOLD_HOURS = 24
 MIN_NET_RR = 2.0
-STRATEGY_VERSION = "entry15m-v2"
+# 2026-10-24 第四轮: 突出度过滤与目标上限语义。3 根 K 线局部极值本身匹配 1H 噪声
+# (实测最近枢轴中位 +0.19 ATR/突出度 0.19 ATR), 旧规则要求它位于 TP2(中位 6 ATR)
+# 之后 —— 几何上不可能, 6 币种 170 天重放 0/153 通过, 等于关闭策略。
+# 现在: 枢轴须比邻居突出至少 MIN_PROMINENCE_ATR*ATR 才算结构; 前方无显著结构
+# 是开阔空间(放行); 有则作为目标上限(tp2 不超过 boundary, 且按 BOUNDARY_CAP_FRAC
+# 收缩留出到达前回头的余量), 不再一票否决。
+MIN_PROMINENCE_ATR = float(os.getenv("RADAR_MIN_PROMINENCE_ATR", "1.0"))
+BOUNDARY_CAP_FRAC = float(os.getenv("RADAR_BOUNDARY_CAP_FRAC", "0.85"))
+STRATEGY_VERSION = "signal-edge-v3"
 SPECS_TTL_MS = 6 * HOUR_MS
 _SPECS_CACHE = {}
 _SPECS_AT_MS = 0
@@ -485,24 +493,34 @@ def round_tick(price, tick, up=False):
 
 
 def structure_boundary(data, direction, entry):
-    """Nearest observed obstacle, using confirmed pivots and the preceding 24h.
+    """Nearest *significant* obstacle ahead of entry; None when none is in view.
 
-    A pivot needs two closed candles on either side; today's still forming high
-    is never treated as a confirmed swing. Unknown space is not a target.
+    A 3-bar local extreme alone matches 1H noise: measured on real 6-symbol data
+    the nearest pivot sat a median 0.19 ATR ahead with 0.19 ATR prominence, while
+    the old rule demanded it lie beyond a ~6 ATR TP2 — 0/153 replayed setups
+    passed, silently disabling the strategy. A pivot now counts only if it
+    protrudes beyond its neighbours by MIN_PROMINENCE_ATR * ATR. The old
+    24h-extreme term is dropped: it supplied noise, not resistance.
+
+    None means genuinely open space and must not be treated as a rejection.
     """
-    levels = []
     key = "high" if direction == "long" else "low"
+    sign = 1 if direction == "long" else -1
+    atr = positive(data.get("1h_atr"), "ATR")
+    ahead = []
     for frame in (data["bars_1h"].iloc[-168:], data["bars_4h"].iloc[-180:]):
         values = frame[key].tolist()
         for i in range(2, len(values) - 2):
             neighbors = values[i-2:i] + values[i+1:i+3]
-            if (values[i] > max(neighbors) if direction == "long" else values[i] < min(neighbors)):
-                levels.append(values[i])
-    recent = data["bars_1h"].iloc[-25:-1][key]
-    levels.append(float(recent.max() if direction == "long" else recent.min()))
-    ahead = [x for x in levels if x > entry] if direction == "long" else [x for x in levels if x < entry]
+            edge = max(neighbors) if direction == "long" else min(neighbors)
+            if not (values[i] > edge if direction == "long" else values[i] < edge):
+                continue
+            if sign * (values[i] - edge) < MIN_PROMINENCE_ATR * atr:
+                continue
+            if sign * (values[i] - entry) > 0:
+                ahead.append(values[i])
     if not ahead:
-        raise StrategyRejected("前方没有可确认的目标结构，暂不生成目标")
+        return None
     return min(ahead) if direction == "long" else max(ahead)
 
 
@@ -545,27 +563,35 @@ def risk_size(plan, equity):
 def validate_plan(plan, data):
     if plan.get("direction") not in ("long", "short"):
         raise StrategyRejected("方向必须明确为 long 或 short")
-    fields = ["entry", "entry_min", "entry_max", "stop", "tp1", "tp2", "hold_hours", "structure_boundary"]
+    fields = ["entry", "entry_min", "entry_max", "stop", "tp1", "tp2", "hold_hours"]
     values = {key: positive(plan.get(key), key) for key in fields}
+    # structure_boundary 可为 None(前方无显著结构 = 开阔空间), 因此不做正数校验
+    boundary = plan.get("structure_boundary")
+    if boundary is not None:
+        positive(boundary, "structure_boundary")
     side = plan["direction"]
     low, high = values["entry_min"], values["entry_max"]
     if not low <= values["entry"] <= high or not 6 <= values["hold_hours"] <= 24:
         raise StrategyRejected("入场区间或持仓时间不合理")
+    atr = positive(data["1h_atr"], "ATR")
     if side == "long":
-        ordered = values["stop"] < low <= high < values["tp1"] < values["tp2"] < values["structure_boundary"]
+        ordered = values["stop"] < low <= high < values["tp1"] < values["tp2"]
         worst = high
         structure = float(data["bars_1h"].low.iloc[-4:].min())
-        beyond_structure = values["stop"] <= structure - .25 * data["1h_atr"] + 1e-9
+        beyond_structure = values["stop"] <= structure - .25 * atr + 1e-9
     else:
-        ordered = values["stop"] > high >= low > values["tp1"] > values["tp2"] > values["structure_boundary"]
+        ordered = values["stop"] > high >= low > values["tp1"] > values["tp2"]
         worst = low
         structure = float(data["bars_1h"].high.iloc[-4:].max())
-        beyond_structure = values["stop"] >= structure + .25 * data["1h_atr"] - 1e-9
+        beyond_structure = values["stop"] >= structure + .25 * atr - 1e-9
+    # 目标不得越过已确认的显著结构(有结构才判; 开阔空间放行)
+    if boundary is not None:
+        ordered = ordered and (values["tp2"] < boundary if side == "long"
+                               else values["tp2"] > boundary)
     if not ordered or not beyond_structure:
         raise StrategyRejected("点位方向、结构外止损或目标空间不合格")
     risk = abs(worst - values["stop"])
     minrisk = min(abs(low-values["stop"]), abs(high-values["stop"]))
-    atr = positive(data["1h_atr"], "ATR")
     if minrisk < 1.5 * atr - 1e-9 or risk > 3 * atr + 1e-9 or risk / worst > .03:
         raise StrategyRejected("止损须至少 1.5 ATR、至多 3 ATR，且不超过价格的 3%")
     loss = risk + cost_per_unit(data, worst, values["stop"], side, values["hold_hours"])
@@ -573,8 +599,15 @@ def validate_plan(plan, data):
     if reward / loss < MIN_NET_RR - 1e-9:
         raise StrategyRejected("最不利入场价扣成本后 TP1 盈亏比不足 2:1")
     actual_boundary = structure_boundary(data, side, worst)
-    if values["structure_boundary"] != actual_boundary:
+    if (boundary is None) != (actual_boundary is None):
         raise StrategyRejected("目标结构与行情证据不一致")
+    if boundary is not None and abs(boundary - actual_boundary) > 1e-6 * atr:
+        raise StrategyRejected("目标结构与行情证据不一致")
+    if actual_boundary is not None:
+        sign = 1 if side == "long" else -1
+        reachable = abs(actual_boundary - worst) * BOUNDARY_CAP_FRAC
+        if sign * (values["tp2"] - worst) > reachable + 1e-9:
+            raise StrategyRejected("目标超出显著结构前的可达空间")
     if any(abs(x - round_tick(x, data["tick_size"])) > 1e-8 for x in [values["stop"], values["tp1"], values["tp2"], low, high]):
         raise StrategyRejected("点位不符合 OKX 价格步长")
     return {"loss_per_unit": loss, "net_rr": reward / loss,
@@ -612,8 +645,12 @@ def build_plan(data, direction=None):
         # Solve net reward = rr * net stop loss, including price-dependent exit fee.
         desired = (rr*loss + worst*(2*(TAKER_FEE+SLIPPAGE)+rate)) / (1-sign*(TAKER_FEE+SLIPPAGE))
         targets.append(round_tick(worst + sign*desired, tick, up=direction == "long"))
-    if sign * (boundary - targets[1]) < .25 * atr:
-        raise StrategyRejected("已知支撑/阻力前的空间不足以容纳净 2R/3R 目标")
+    if boundary is not None:
+        # 目标是显著阻力前的一段可达空间, 不是固定 3R。boundary=None 即开阔空间,
+        # 按固定 R 目标放行(旧代码在这里 raise, 是零信号的直接来源)。
+        reachable = abs(boundary - worst) * BOUNDARY_CAP_FRAC
+        if sign * (targets[1] - worst) > reachable + 1e-9:
+            raise StrategyRejected("已知支撑/阻力前的空间不足以容纳净 3R 目标")
     plan = {"symbol": data["symbol"], "direction": direction, "entry": entry,
             "entry_min": lower, "entry_max": upper,
             "stop": stop, "tp1": targets[0], "tp2": targets[1],
@@ -691,6 +728,10 @@ def format_strategy_text(plan):
     d = "做多 🟢" if long_side else "做空 🔴"
     worst = plan["entry_max"] if long_side else plan["entry_min"]
     stop_pct = abs(worst - plan["stop"]) / worst * 100
+    boundary = plan.get("structure_boundary")
+    space = (f"目标按净盈亏比 2R/3R 预设，前方已确认结构边界 {boundary:.2f}。"
+             if boundary is not None else
+             "目标按净盈亏比 2R/3R 预设，前方暂无显著结构，空间开阔。")
     return (
         f"【方向】：{d}\n"
         f"【建议入场】：{plan['entry_min']:.2f} – {plan['entry_max']:.2f}"
@@ -702,7 +743,7 @@ def format_strategy_text(plan):
         f"超时则{plan['timeout_action']}\n"
         f"【核心逻辑】：4H 趋势排列与动能一致，1H 回踩均线后出现同向收盘"
         f"反转，且最新已收盘 15m 同向站上 EMA20；止损置于近端结构之外，"
-        f"目标按净盈亏比 2R/3R 预设，前方已确认结构边界 {plan['structure_boundary']:.2f}。"
+        f"{space}"
         f"单笔风险不超过账户权益的 {plan['account_risk_pct']:.1f}%。"
     )
 

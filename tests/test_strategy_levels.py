@@ -20,13 +20,79 @@ class LevelTests(unittest.TestCase):
                 gain = abs(plan["tp1"]-entry)-s.cost_per_unit(data,entry,plan["tp1"],side)
                 self.assertGreaterEqual(gain/loss,2)
 
-    def test_unknown_or_nearby_structure_rejected(self):
-        for case in ("unknown", "nearby"):
+    def test_open_space_allowed_nearby_structure_rejected(self):
+        """2026-10-24 语义修正: 前方无显著结构是开阔空间(放行), 不再是拒绝理由。
+        旧断言要求两者都拒绝, 正是把策略整体关闭的那条 bug 的测试侧镜像。"""
+        data = market()
+        for frame in (data["bars_1h"], data["bars_4h"]):
+            frame.loc[frame.high > 105, "high"] = 100.4
+        with clock():
+            plan = s.build_plan(data)
+        self.assertIsNone(plan["structure_boundary"])
+        self.assertIn("暂无显著结构", s.format_strategy_text(plan))
+        # 显著结构就在 TP2 之前: 目标不可越过它
+        data = market()
+        for frame in (data["bars_1h"], data["bars_4h"]):
+            frame.loc[frame.high > 105, "high"] = 100.4
+        data["bars_1h"].loc[len(data["bars_1h"])-10, "high"] = 103
+        with clock(), self.assertRaisesRegex(s.StrategyRejected, "支撑/阻力"):
+            s.build_plan(data)
+
+    def test_noise_pivots_do_not_form_boundary(self):
+        """3 根 K 线局部极值本身匹配噪声; 突出度不足 MIN_PROMINENCE_ATR*ATR
+        的枢轴不得构成边界(否则旧 bug 复现: 边界总在 TP2 之前)。"""
+        data = market()
+        for frame in (data["bars_1h"], data["bars_4h"]):
+            frame.loc[frame.high > 105, "high"] = 100.4
+        # 前方 0.3 ATR 处的微小凸起: 不是结构
+        data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 100.7
+        self.assertIsNone(s.structure_boundary(data, "long", 101.1))
+        with clock():
+            self.assertIsNone(s.build_plan(data)["structure_boundary"])
+        # 同样的凸起若突出 3 ATR 就是真结构
+        data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 103.4
+        self.assertAlmostEqual(
+            s.structure_boundary(data, "long", 101.1), 103.4)
+
+    def test_boundary_as_target_cap_not_veto(self):
+        """结构在 TP2 之后且空间足够 = 放行并记录边界; 结构把空间压到不足
+        3R 之内 = 拒绝。boundary 是目标上限, 不是一票否决。"""
+        for offset, expect_ok in ((12.0, True), (4.0, False)):
             data = market()
             for frame in (data["bars_1h"], data["bars_4h"]):
                 frame.loc[frame.high > 105, "high"] = 100.4
-            if case == "nearby": data["bars_1h"].loc[len(data["bars_1h"])-10,"high"] = 103
-            with self.subTest(case=case), clock(), self.assertRaises(s.StrategyRejected): s.build_plan(data)
+            data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 101 + offset
+            with self.subTest(offset=offset), clock():
+                if expect_ok:
+                    plan = s.build_plan(data)
+                    self.assertAlmostEqual(plan["structure_boundary"], 101 + offset)
+                    self.assertLess(plan["tp2"], plan["structure_boundary"])
+                else:
+                    with self.assertRaises(s.StrategyRejected):
+                        s.build_plan(data)
+
+    def test_prominence_threshold_is_configurable(self):
+        """枢轴突出度 = 与邻居(100.4)之差; 1.6 ATR 的凸起在阈值 2.0 下被当噪声
+        丢弃, 在阈值 1.0 下算结构。"""
+        data = market()
+        for frame in (data["bars_1h"], data["bars_4h"]):
+            frame.loc[frame.high > 105, "high"] = 100.4
+        data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 102.0  # 突出 1.6 ATR
+        original = s.MIN_PROMINENCE_ATR
+        try:
+            s.MIN_PROMINENCE_ATR = 2.0
+            self.assertIsNone(s.structure_boundary(data, "long", 101.1))
+            s.MIN_PROMINENCE_ATR = 1.0
+            self.assertAlmostEqual(s.structure_boundary(data, "long", 101.1), 102.0)
+        finally:
+            s.MIN_PROMINENCE_ATR = original
+
+    def test_short_side_boundary_uses_lows(self):
+        data = market("short")
+        for frame in (data["bars_1h"], data["bars_4h"]):
+            frame.loc[frame.low < 95, "low"] = 99.5
+        data["bars_1h"].loc[len(data["bars_1h"])-30, "low"] = 96.5
+        self.assertAlmostEqual(s.structure_boundary(data, "short", 98.9), 96.5)
 
     def test_bad_numbers_direction_and_hours_rejected(self):
         data, plan = self.make()
