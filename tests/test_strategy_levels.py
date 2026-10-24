@@ -35,7 +35,7 @@ class LevelTests(unittest.TestCase):
         for frame in (data["bars_1h"], data["bars_4h"]):
             frame.loc[frame.high > 105, "high"] = 100.4
         data["bars_1h"].loc[len(data["bars_1h"])-10, "high"] = 103
-        with clock(), self.assertRaisesRegex(s.StrategyRejected, "支撑/阻力"):
+        with clock(), self.assertRaisesRegex(s.StrategyRejected, "不足以容纳净 2R"):
             s.build_plan(data)
 
     def test_noise_pivots_do_not_form_boundary(self):
