@@ -54,6 +54,30 @@ class LevelTests(unittest.TestCase):
         self.assertAlmostEqual(
             s.structure_boundary(data, "long", 101.1), 103.4)
 
+    def test_tp2_is_min_of_fixed_3r_and_reachable(self):
+        """TP2 = min(净 3R, 结构前可达空间)。结构够远时必须保留净 3R,
+        不能被推到"结构前 85%"处放大目标(实现曾无条件取 reachable)。"""
+        def build(offset):
+            data = market()
+            for frame in (data["bars_1h"], data["bars_4h"]):
+                frame.loc[frame.high > 105, "high"] = 100.4
+            data["bars_1h"].loc[len(data["bars_1h"])-30, "high"] = 101 + offset
+            with clock():
+                return data, s.build_plan(data)
+
+        # 结构在 6 ATR: 可达空间 5.10 比净 3R 更近 -> TP2 收回
+        # (多头 round_tick(up=True), 允许一个 tick 的上取整偏差)
+        data_near, near = build(6.0)
+        tick = data_near["tick_size"]
+        self.assertAlmostEqual(near["tp2"], 101 + 6.0 * s.BOUNDARY_CAP_FRAC,
+                               delta=tick + 1e-9)
+        # 结构在 12 ATR: 可达空间 10.20 远于净 3R -> TP2 保持净 3R
+        _, far = build(12.0)
+        self.assertLess(far["tp2"], 101 + 12.0 * s.BOUNDARY_CAP_FRAC)
+        self.assertGreater(far["net_rr"], 2.0)
+        # 两条分支的 TP1 相同(净 2R 下限不受 cap 影响)
+        self.assertAlmostEqual(near["tp1"], far["tp1"], delta=1e-6)
+
     def test_boundary_as_target_cap_not_veto(self):
         """结构在 TP2 之后且空间足够 = 放行并记录边界; 结构把空间压到不足
         3R 之内 = 拒绝。boundary 是目标上限, 不是一票否决。"""

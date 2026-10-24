@@ -665,10 +665,15 @@ def build_plan(data, direction=None):
         reachable = abs(boundary - worst) * BOUNDARY_CAP_FRAC
         if sign * (targets[0] - worst) > reachable + 1e-9:
             raise StrategyRejected("显著结构前的空间不足以容纳净 2R 目标 TP1")
-        capped = round_tick(worst + sign * reachable, tick, up=direction == "short")
-        if sign * (capped - targets[0]) <= 1e-9:
-            raise StrategyRejected("可达空间不足以在 TP1 之外再设 TP2")
-        targets[1] = capped
+        # TP2 = min(固定 3R, 可达空间): 结构够远就保留 3R, 够近才收回来。
+        # 无条件取 reachable 会把 TP2 推到结构前 85% 处, 反而放大目标、
+        # 与"净 3R"口径脱钩(本行曾是实现 bug, 由回放与生产对比发现)。
+        if sign * (targets[1] - worst) > reachable + 1e-9:
+            capped = round_tick(worst + sign * reachable, tick,
+                                up=direction == "short")
+            if sign * (capped - targets[0]) <= 1e-9:
+                raise StrategyRejected("可达空间不足以在 TP1 之外再设 TP2")
+            targets[1] = capped
     plan = {"symbol": data["symbol"], "direction": direction, "entry": entry,
             "entry_min": lower, "entry_max": upper,
             "stop": stop, "tp1": targets[0], "tp2": targets[1],
