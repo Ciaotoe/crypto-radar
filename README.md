@@ -70,4 +70,22 @@ uv run --no-sync python backtest.py --snapshot tests/fixtures/doge_1h.json.gz   
 uv run --no-sync python backtest.py --symbols DOGE/USDT --days 170 --record OUT.json.gz
 ```
 
-重放直接调用 `strategy.signal_direction` / `strategy.build_plan`，不复制判定逻辑，避免"回放一套口径、生产另一套口径"再次掩盖问题。已知近似（结果偏乐观，输出中显式标注）：15m 触发门被 stub 放行（OKX `history-candles` 的 15m 深度仅约 22h），故信号数与期望是生产口径的**上界**；历史资金费率不可得，成本按 0 计；成交与离场按已收盘 1H bar 判定，同根先止损后止盈。
+重放直接调用 `strategy.signal_direction` / `strategy.build_plan`，不复制判定逻辑，避免"回放一套口径、生产另一套口径"再次掩盖问题。已知近似（结果偏乐观，输出中显式标注）：15m 触发门被 stub 放行（OKX `history-candles` 的 15m 深度仅约 15 天（2026-10-25 实测 1,500 根）），故信号数与期望是生产口径的**上界**；历史资金费率不可得，成本按 0 计；成交与离场按已收盘 1H bar 判定，同根先止损后止盈。
+
+### 边际研究回路（第五轮，2026-10-25）
+
+第四轮实测结论：现有趋势回调/突破规则在 6 币种 × 170 天上胜率 33.3%、单笔期望 -0.153R、PF 0.76 —— 门槛方向正确（滤掉了明显亏钱的机会），但**没有正边际**。继续收紧参数只会把样本压到无法统计，因此本轮不再调生产阈值，转而建立新信号特征的可测量研究回路。
+
+OKX `history-candles` 的 1H 深度远超之前认知（BTC 自 2019-12，SOL 自 2021-01，DOGE 自 2020-07），可用样本从"6 币种 × 170 天"扩大到"14 币种 × 4–6 年"。
+
+```bash
+uv run --no-sync python research/fetch_corpus.py          # 下载语料到 research/data/(gitignore)
+uv run --no-sync python research/screen.py                # 全部特征族, 训练/测试分段统计
+uv run --no-sync python research/screen.py --family squeeze_breakout --json
+```
+
+`research/screen.py` 的口径：特征 → 向量化事件检测（只用已收盘 bar，事件在 i 根收盘成立、i+1 根开盘入场，无前视）→ 离场复用 `backtest.simulate_walk`（与生产重放同一内核，不复制离场数学）→ 训练段（< 2025-01-01）/测试段（≥）分段报告 n、胜率 + Wilson 95% 区间、期望 R、t 值、PF。每笔扣双边 taker+滑点成本 0.14%。
+
+已知近似与偏差（结论必须带上）：资金费率历史仅约 1 个月深度，重放 funding 仍按 0 计，是上界；15m 触发门无法重放；语料按今日流动性名单选币，存在幸存者偏差。统计纪律：训练段调参、测试段只读一次，测试段 t<2 或期望变号即判为无提升，不得回头改测试段口径。
+
+筛出的特征若要进生产，另立一轮并过 `backtest.py` 漏斗验证 —— 研究回路不碰 `strategy.py` 阈值与 `signals.json` 契约。

@@ -16,3 +16,7 @@ data/klines_4h.json
 
 # 外部参考文件(用户提供的对照版, 仅评审用, 2026-10-21)
 new/
+
+# 研究语料与结果(大文件, 可复现下载, 2026-10-25 第五轮)
+research/data/
+research/results/

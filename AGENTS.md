@@ -28,3 +28,10 @@
 - 测试需要冻结 `strategy.time.time`（行情新鲜度校验依赖真实时钟，fixture 行情是固定时间戳）；`crypto_radar` 模块级读取密钥环境变量，测试 patch 模块属性而非 `os.environ`。
 - **手工构造的行情 fixture 只能覆盖单点几何，不能用来判断门槛是否可触发**：`strategy_fixtures.market()` 把阻力植入 9–11 ATR 外（真实显著结构中位仅 1.6 ATR 外），曾使 74 个测试全绿而生产零信号。这类保证由 `tests/test_backtest.py` + 录制快照承担；新增"门槛能出信号"类断言一律走快照，不要往 `strategy_fixtures.py` 里加手工开阔空间。
 - 筛选阈值（ADX 下限、RSI 带、反转收盘位、偏离倍数、止损 ATR/百分比上下限）是 `strategy.py` 的具名模块常量，`backtest.py` 运行时读取同一份，不得在回放侧重定义字面量。
+
+## 研究回路边界（2026-10-25 第五轮确立）
+
+- `research/` 是独立的边际研究区：`fetch_corpus.py` 下载多币种全历史 1H 语料到 `research/data/`（gitignore，可复现），`screen.py` 做特征族筛选（事件 → 离场 → 训练/测试分段统计）。**研究回路不碰 `strategy.py` 生产阈值与 `signals.json` 契约**；筛出的特征进生产须另立一轮并过 `backtest.py` 漏斗验证。
+- 离场模拟唯一内核是 `backtest.simulate_walk`（数组口径），`backtest.simulate` 与 `research/screen.py` 都调它，禁止复制离场数学（第四轮两套口径漂移教训）。
+- 筛选统计纪律：训练段（<2025-01-01）调参、测试段只读一次；测试段 t<2 或期望变号 = 无提升，不得回头改测试段口径。每笔扣 0.14% 双边成本；funding=0 与幸存者偏差须在结论中显式标注。
+- OKX 数据深度实测（2026-10-25）：1H 自 2019-12（BTC）；15m 仅 ~15 天（15m 触发门不可重放，所有重放数字是上界）；funding-rate-history 仅 ~1 个月。
