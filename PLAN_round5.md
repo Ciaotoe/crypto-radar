@@ -27,7 +27,7 @@
 
 ## 步骤与验收标准
 
-1. [ ] **语料下载**（进行中，后台）（`research/fetch_corpus.py`）
+1. [x] **语料下载**（`research/fetch_corpus.py`）
    - 14 币种全历史 1H（~2500 天；APT/ARB/OP/SUI 上市晚于 2021-06，排除保持语料矩形）录制为与 `backtest.py --record` 相同的
      快照格式，存 `research/data/`（gitignore）。
    - 验收：每币种快照可被 `backtest.load_snapshot` 加载；BTC 语料起点
@@ -41,11 +41,11 @@
    - 验收：`tests/test_research_screen.py` 覆盖事件检测、分段归属、
      成本扣减、Wilson 区间数学；对同一批事件，screen 的离场模拟与直接
      调 `backtest.simulate` 结果一致（防两套口径漂移——第四轮教训）。
-4. [ ] **首批筛选运行 + 如实报告**：baseline（无条件）+ `squeeze_breakout`
+4. [x] **首批筛选运行 + 如实报告**：baseline（无条件）+ `squeeze_breakout`
    + `vol_imbalance`，全语料，分段输出 n/winR/expR/t/PF。
    - 验收：结果写入 `research/results/`（gitignore）与 PLAN 完成记录；
      测试段期望与 Wilson 下界如实呈现，正/负都记录。
-5. [ ] 文档同步（AGENTS.md 研究回路一节、README 提及）、提交。
+5. [x] 文档同步（AGENTS.md 研究回路一节、README 提及）、提交。
 
 ## 已知约束
 
@@ -68,4 +68,55 @@
 - 2026-10-25: 步骤 3 完成 —— `research/screen.py`（3 个特征族 + 分段统计）
   与 `tests/test_research_screen.py`（8 项，含内核同一性断言）全过。
   入场口径修正：事件 i 根收盘成立 → i+1 根开盘入场（无前视、fill 无歧义）。
-- 2026-10-25: 步骤 1 语料下载进行中（后台，BTC 快照已落地）。
+- 2026-10-25: 步骤 1 完成 —— 14/14 币种快照落地（BTC 2019-12-19 起，
+  总计 78.8 万根 1H bar，跨度 ~6.8 年）；specs 均为真实合约规格（无
+  approximated）；下载日志无失败。验收项"BTC 起点 ≤ 2020-01"满足
+  （2019-12-19）。
+- 2026-10-25: BTC 单币冒烟运行 screen.py 通过（baseline 全段 expR
+  -0.154R t=-5.9，符合"无条件入场必亏成本"的预期方向）。
+- 2026-10-25: 首轮全语料运行暴露数据缺陷 —— ADA 2020-03 上市初期死带
+  bar（OHLC 全平、vol=0，tick 舍入后 ATR>0 但 ~1e-12 相对价格）使
+  baseline expR 污染到 -1.3e8 R。新增 MIN_ATR_FRAC=1e-4 守卫 + 回归测试
+  （含微振幅变体，防假通过——第四轮教训），提交 81918ef。
+- 2026-10-25: 步骤 4/5 完成。全量 94 测试通过；结果与结论见下方完成记录。
+
+## 完成记录（第五轮，2026-10-25）
+
+### 全语料筛选结果（14 币种 × 2019-12–2026-10，78.8 万根 1H bar）
+
+口径：事件收盘成立 → 次根开盘入场；离场走 backtest.simulate_walk 同一内核；
+每笔扣 0.14% 双边成本；funding=0（上界）；幸存者偏差（按今日流动性选币）。
+
+| family | 段 | n | winR [Wilson95] | expR | t | PF |
+| --- | --- | --- | --- | --- | --- | --- |
+| baseline | train | 23,417 | 0.362 [.356,.368] | -0.126 | -14.7 | 0.81 |
+| baseline | test | 9,268 | 0.356 [.346,.366] | -0.159 | -11.7 | 0.77 |
+| squeeze_breakout | train | 5,321 | 0.378 [.365,.391] | -0.070 | -3.9 | 0.89 |
+| squeeze_breakout | test | 2,139 | 0.350 [.330,.370] | -0.152 | -5.5 | 0.77 |
+| vol_imbalance | train | 6,643 | 0.389 [.378,.401] | -0.057 | -3.5 | 0.91 |
+| vol_imbalance | test | 2,912 | 0.385 [.368,.403] | -0.070 | -2.8 | 0.89 |
+
+结果文件：`research/results/screen_*.json`（gitignore，可用 --json 复现）。
+
+### 如实结论
+
+- **两个候选信号族都没有正边际**。按预注册纪律（测试段 t<2 或期望变号 =
+  无提升）：squeeze_breakout 测试段期望恶化（-0.070 → -0.152，train/test
+  变号级退化），直接淘汰；vol_imbalance 测试段 -0.070R、t=-2.80，
+  **显著为负**，同样不提升。
+- 但两者都**显著优于 baseline**（vol_imbalance 全段 -0.061R vs baseline
+  -0.136R，train/test 两段方向一致），说明特征本身携带信息——量价失衡
+  选出的时段确实比随机时段的 2R/3R 几何亏损更少。亏损主体是 0.14% 成本
+  加上"1H 收盘入场 + 固定 1.5 ATR 止损"几何本身的高止损率（~57%）。
+- 推论（待下一轮验证，不在本轮宣称）：正边际的缺口不在"事件选择"而在
+  "离场几何"——vol_imbalance 事件上换更宽止损/跟踪离场/更早 TP1 的
+  消融是下一个最便宜的实验；生产判定栈的 S5 偏离门（消融中边际最大
+  +0.129R）与本回路的 vol_imbalance 属同类信息（入场时机质量），方向
+  互相印证。
+- 本轮不碰生产阈值、不下"找到边际"结论。
+
+### 提交
+
+- b5be84b simulate 数组内核化（doge 快照逐项一致）
+- 2855624 研究回路（fetch_corpus + screen + 9 项测试 + 文档）
+- 81918ef 死带守卫 + 回归测试

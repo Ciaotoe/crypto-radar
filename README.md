@@ -89,3 +89,5 @@ uv run --no-sync python research/screen.py --family squeeze_breakout --json
 已知近似与偏差（结论必须带上）：资金费率历史仅约 1 个月深度，重放 funding 仍按 0 计，是上界；15m 触发门无法重放；语料按今日流动性名单选币，存在幸存者偏差。统计纪律：训练段调参、测试段只读一次，测试段 t<2 或期望变号即判为无提升，不得回头改测试段口径。
 
 筛出的特征若要进生产，另立一轮并过 `backtest.py` 漏斗验证 —— 研究回路不碰 `strategy.py` 阈值与 `signals.json` 契约。
+
+首批结果（14 币种 × 2019-12–2026-10，78.8 万根 bar）：squeeze_breakout 与 vol_imbalance 均无正边际（测试段 expR 分别 -0.152R、-0.070R，均显著为负），但 vol_imbalance 显著优于 baseline（-0.061R vs -0.136R），特征携带信息、缺口在离场几何。详见 PLAN_round5.md 完成记录。
