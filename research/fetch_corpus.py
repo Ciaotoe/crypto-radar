@@ -50,7 +50,9 @@ def main(argv):
     for symbol in symbols:
         try:
             fetch_one(symbol)
-        except Exception as exc:  # one coin failing must not kill the corpus
+        except (Exception, SystemExit) as exc:
+            # one coin failing must not kill the corpus; record_snapshot
+            # raises SystemExit (BaseException) on insufficient history.
             failed.append(symbol)
             print(f"[{symbol}] 下载失败: {exc}", file=sys.stderr)
     if failed:

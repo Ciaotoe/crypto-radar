@@ -248,7 +248,8 @@ def report(frames, families, as_json=False):
             if s["n"] == 0:
                 lines.append(f"  {label:5s} n=0")
                 continue
-            pf = f"{s['profit_factor']:.2f}" if s["profit_factor"] else "inf"
+            pf = (f"{s['profit_factor']:.2f}"
+                  if s["profit_factor"] is not None else "inf")
             lines.append(
                 f"  {label:5s} n={s['n']:5d} winR={s['win_rate']:.3f} "
                 f"[{s['wilson95'][0]:.3f},{s['wilson95'][1]:.3f}] "

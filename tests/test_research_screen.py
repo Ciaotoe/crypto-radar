@@ -38,19 +38,33 @@ def synthetic_frame(n=600, seed=7):
 class KernelParityTests(unittest.TestCase):
     """screen 的成交/离场必须与 backtest.simulate 完全一致(同一内核)。"""
 
-    def test_screen_uses_backtest_kernel(self):
+    def test_screen_trades_match_direct_kernel_calls(self):
+        """run_family 的每笔成交/离场必须与直接调 simulate_walk 逐项一致。
+
+        复核指出原断言是"自己调自己比较"恒真; 这里改为端到端: 从 run_family
+        的产出反推离场内核的输入(entry=i+1 开盘, stop=1.5 ATR, TP1/TP2 =
+        2R/3R), 直接调 backtest.simulate_walk, 断言 outcome 与净 pnl 相等。
+        """
         d = SC.enrich(synthetic_frame())
+        trades = SC.run_family({"X/USDT": d}, "baseline", SC.family_baseline,
+                               cooldown_bars=1)
+        self.assertGreater(len(trades), 3)
         high, low, close = d.high.values, d.low.values, d.close.values
-        i, sign, entry = 300, 1, float(close[300])
-        stop = entry - sign * 1.5 * float(d.atr.iloc[300])
-        risk = abs(entry - stop)
-        direct = B.simulate_walk(high, low, close, i, sign, entry, stop,
-                                 entry + 2 * risk, entry + 3 * risk,
-                                 hold_bars=24, fill_bars=1)
-        # Same call path screen.run_family takes.
-        self.assertEqual(direct["outcome"], B.simulate_walk(
-            high, low, close, i, sign, entry, stop, entry + 2 * risk,
-            entry + 3 * risk, hold_bars=24, fill_bars=1)["outcome"])
+        ts_to_i = {int(t): k for k, t in enumerate(d.ts.values)}
+        for t in trades[:5]:
+            i = ts_to_i[t["ts"]]
+            sign = t["sign"]
+            entry = float(d.open.values[i + 1])
+            stop = entry - sign * 1.5 * float(d.atr.iloc[i])
+            risk = abs(entry - stop)
+            direct = B.simulate_walk(high, low, close, i, sign, entry, stop,
+                                     entry + sign * risk * 2,
+                                     entry + sign * risk * 3,
+                                     hold_bars=24, fill_bars=1)
+            self.assertEqual(direct["outcome"], t["outcome"])
+            self.assertAlmostEqual(direct["pnl_pct"] - SC.ROUND_TRIP_COST_PCT,
+                                   t["pnl_pct"], places=9)
+            self.assertAlmostEqual(risk / entry * 100, t["risk_pct"], places=9)
         self.assertIs(SC.B.simulate_walk, B.simulate_walk)
 
 

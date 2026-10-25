@@ -115,8 +115,31 @@
   互相印证。
 - 本轮不碰生产阈值、不下"找到边际"结论。
 
+### 独立只读复核（plan-reviewer）结果与处置
+
+复核判定 **PASS**：语料完整性（14/14 可加载、bar 数与日志一致、specs 无
+approximated）、内核唯一性（用重构前版本重跑 doge 对比逐项一致）、无前视
+（rank/shift/rolling 逐表达式核查）、索引对齐（经验证与纯位置掩码逐位相等）、
+Wilson/t/PF 数学、PLAN 数字与 results JSON 逐格一致、红线（strategy.py /
+signals.json / .env 零触碰、无新增依赖、gitignore 覆盖）均确认。
+
+三项次要发现，均已修复：
+
+1. **F1** `fetch_corpus.py` 的 `except Exception` 接不住 `record_snapshot`
+   抛出的 `SystemExit`（BaseException），短历史币种会终止整个下载循环而非
+   "显式报错并继续"。已改为 `except (Exception, SystemExit)`。本轮语料
+   14/14 成功，属潜在缺口非错误结果。
+2. **N1** 内核同一性测试原断言是"自己调自己"恒真。已改为端到端：从
+   `run_family` 产出反推离场输入，直接调 `simulate_walk` 逐项比对
+   outcome/净 pnl/risk_pct（若 screen 出现第二套离场数学该测试必失败）。
+3. **N2** 文本模式 PF=0.0（段内零胜）会误渲染为 "inf"。改为
+   `is not None` 判断。JSON 输出与本轮报告数字不受影响。
+
 ### 提交
 
 - b5be84b simulate 数组内核化（doge 快照逐项一致）
 - 2855624 研究回路（fetch_corpus + screen + 9 项测试 + 文档）
 - 81918ef 死带守卫 + 回归测试
+- ff368b8 第五轮完成记录
+- （待提交）复核三项处置：F1 SystemExit 捕获 / N1 端到端内核一致性测试 /
+  N2 PF 渲染
