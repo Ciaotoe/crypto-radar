@@ -11,7 +11,7 @@ the "tests green, production silent" defect hid for days.
 
 Known approximations, stated rather than papered over:
   - The 15m trigger gate is STUBBED to always confirm, because OKX
-    history-candles holds only ~22h of 15m depth. Every count here is
+    history-candles holds ~15 days of 15m depth (measured 2026-10-25: 1500 bars). Every count here is
     therefore an UPPER BOUND on production signal volume and expectancy.
   - Historical funding rates are unavailable per-bar; funding is set to 0.
     Production costs are higher than measured here.
@@ -306,24 +306,28 @@ def evaluate_bar(d, h4, i, symbol, specs):
         S.time = saved
 
 
-def simulate(d, i, plan, hold_bars=24, fill_bars=4):
-    """Forward-simulate a plan on closed 1H bars; stop-first tie-break."""
-    sign = 1 if plan["direction"] == "long" else -1
-    worst = plan["entry_max"] if sign > 0 else plan["entry_min"]
-    stop, tp1, tp2 = plan["stop"], plan["tp1"], plan["tp2"]
+def simulate_walk(high, low, close, i, sign, worst, stop, tp1, tp2,
+                  hold_bars=24, fill_bars=4):
+    """Array-kernel forward simulation — the single source of truth for exits.
+
+    `simulate` and research/screen.py both call this; a second copy of exit
+    logic is exactly how the round-4 口径 drift happened. Semantics (unchanged
+    from the original iloc loop): pending fill within `fill_bars`, then
+    TP1-arm → breakeven stop, stop-before-TP2 within the same bar resolves
+    stop-first (conservative), timeout exits at close of bar i+hold_bars.
+    """
+    n = len(high)
     filled = False
-    for k in range(i + 1, min(len(d), i + 1 + fill_bars)):
-        bar = d.iloc[k]
-        if (bar.low <= worst if sign > 0 else bar.high >= worst):
+    for k in range(i + 1, min(n, i + 1 + fill_bars)):
+        if (low[k] <= worst if sign > 0 else high[k] >= worst):
             filled = True
             break
     if not filled:
         return {"outcome": "not_entered", "pnl_pct": None, "mfe": None, "mae": None}
     tp1_hit = False
     mfe = mae = 0.0
-    for k in range(i + 1, min(len(d), i + 1 + hold_bars)):
-        bar = d.iloc[k]
-        hi, lo = float(bar.high), float(bar.low)
+    for k in range(i + 1, min(n, i + 1 + hold_bars)):
+        hi, lo = float(high[k]), float(low[k])
         fav = sign * (hi - worst) / worst * 100
         unfav = sign * (lo - worst) / worst * 100
         mfe, mae = max(mfe, fav), min(mae, unfav)
@@ -339,9 +343,18 @@ def simulate(d, i, plan, hold_bars=24, fill_bars=4):
         if (hi >= tp2 if sign > 0 else lo <= tp2):
             return {"outcome": "took_profit", "mfe": mfe, "mae": mae,
                     "pnl_pct": 0.5 * (abs(tp1 - worst) + abs(tp2 - worst)) / worst * 100}
-    exitp = float(d.iloc[min(len(d) - 1, i + hold_bars)].close)
+    exitp = float(close[min(n - 1, i + hold_bars)])
     return {"outcome": "timeout", "mfe": mfe, "mae": mae,
             "pnl_pct": sign * (exitp - worst) / worst * 100}
+
+
+def simulate(d, i, plan, hold_bars=24, fill_bars=4):
+    """DataFrame adapter over simulate_walk (production replay entry point)."""
+    sign = 1 if plan["direction"] == "long" else -1
+    worst = plan["entry_max"] if sign > 0 else plan["entry_min"]
+    return simulate_walk(d.high.values, d.low.values, d.close.values, i, sign,
+                         worst, plan["stop"], plan["tp1"], plan["tp2"],
+                         hold_bars, fill_bars)
 
 
 def stats(events):
@@ -375,7 +388,7 @@ def stats(events):
 
 
 APPROXIMATIONS = [
-    "15m trigger gate stubbed open (~22h history depth): counts are an UPPER BOUND",
+    "15m trigger gate stubbed open (~15d history depth): counts are an UPPER BOUND",
     "historical funding unavailable; funding cost = 0, real costs are higher",
     "fills/exits on closed 1H bars, stop-first tie-break, not tick data",
     "spread/mark checks see a synthesized tight quote and never reject",
