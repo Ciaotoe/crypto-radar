@@ -118,6 +118,34 @@ class SplitAndCostTests(unittest.TestCase):
         self.assertGreater(lo, 0.95)
         self.assertLessEqual(hi, 1.0)
 
+    def test_dead_tape_bars_skipped(self):
+        """Flat listing bars (ATR>0 but ~0 vs price) must not produce trades.
+
+        Real case: ADA 2020-03 opening bars are OHLC all 0.041 with vol 0 —
+        risk_pct ~1e-12 made baseline expR explode to -1.3e8 R.
+        """
+        n = 400
+        ts = 1_700_000_000_000 + np.arange(n) * HOUR_MS
+        flat = pd.DataFrame({"ts": ts, "open": 0.041, "high": 0.041,
+                             "low": 0.041, "close": 0.041, "vol": 0.0})
+        frames = {"X/USDT": SC.enrich(flat)}
+        trades = SC.run_family(frames, "baseline", SC.family_baseline)
+        self.assertEqual(trades, [])
+        # Micro-range variant: ATR > 0 but far below MIN_ATR_FRAC of price —
+        # this is what the new guard exists for (the old atr<=0 check misses it).
+        micro = flat.copy()
+        micro["high"] = 0.041 * (1 + SC.MIN_ATR_FRAC / 10)
+        d = SC.enrich(micro)
+        # baseline fires on its first eligible bar (WARMUP_BARS), so assert on
+        # the ATR actually consulted at the event index.
+        a = float(d.atr.iloc[SC.WARMUP_BARS])
+        self.assertTrue(math.isfinite(a) and a > 0,
+                        "ATR 必须为正, 否则测的是旧 atr<=0 分支")
+        self.assertLess(a / 0.041, SC.MIN_ATR_FRAC)
+        frames = {"X/USDT": d}
+        self.assertEqual(SC.run_family(frames, "baseline",
+                                       SC.family_baseline), [])
+
     def test_cooldown_suppresses_overlapping(self):
         d = SC.enrich(synthetic_frame(n=600))
         frames = {"X/USDT": d}

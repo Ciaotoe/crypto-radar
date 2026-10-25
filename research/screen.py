@@ -19,6 +19,7 @@ Usage:
   uv run --no-sync python research/screen.py --json > research/results/run.json
 """
 import argparse
+import datetime
 import glob
 import json
 import math
@@ -39,6 +40,9 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 SPLIT_UTC = pd.Timestamp("2025-01-01", tz="UTC").value // 10**6  # ms
 ROUND_TRIP_COST_PCT = 2 * (S.TAKER_FEE + S.SLIPPAGE) * 100  # 0.14%
+# ATR below this fraction of price = dead tape (flat OHLC listing bars); such
+# bars would produce risk_pct ~ 0 and R-multiples of ~1e11. See run_family.
+MIN_ATR_FRAC = 1e-4
 
 # Warmup: indicators need history before the first usable bar. EMA200 on the
 # 4H resample needs ~800 1H bars to settle; families below cap at 1H-only
@@ -164,6 +168,11 @@ def run_family(frames, name, fn, cooldown_bars=24):
             last_i = i
             if not math.isfinite(atr[i]) or atr[i] <= 0 or i + 1 >= len(d):
                 continue
+            # Dead-tape guard: early-listing bars can be flat OHLC with 0 vol
+            # (observed on ADA 2020-03), leaving ATR ~0 but > 0 after tick
+            # rounding. risk_pct then collapses and R-multiples explode.
+            if atr[i] / close[i] < MIN_ATR_FRAC:
+                continue
             sign = int(direction[i])
             # Event is known at bar i's close → enter at bar i+1's OPEN.
             # worst=open[i+1] guarantees fill on the first bar (low<=open),
@@ -266,7 +275,7 @@ def main(argv=None):
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         os.makedirs(RESULTS_DIR, exist_ok=True)
-        path = os.path.join(RESULTS_DIR, f"screen_{pd.Timestamp.utcnow():%Y%m%d_%H%M%S}.json")
+        path = os.path.join(RESULTS_DIR, f"screen_{pd.Timestamp.now(datetime.UTC):%Y%m%d_%H%M%S}.json")
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(result, fh, ensure_ascii=False, indent=2, default=str)
         print(f"saved -> {path}", file=sys.stderr)
